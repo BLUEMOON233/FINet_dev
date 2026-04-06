@@ -1,0 +1,43 @@
+name: baseline
+phase: default
+
+target:
+  _target_: src.model.trainer_forecast.Trainer
+  model:
+    type: 'ModelForecast'
+    embed_dim: 128
+    future_steps: 60
+    num_modes: ${num_modes}
+    num_heads: 8
+    mlp_ratio: 4.0
+    qkv_bias: False
+    drop_path: 0.2
+    enc_layer_1: ${enc_layer_1}
+    enc_layer_2: ${enc_layer_2}
+    dec_layer_1: ${dec_layer_1}
+    dec_layer_2: ${dec_layer_2}
+    use_goal_conditioned_tokens: ${use_goal_conditioned_tokens}
+    num_goal_candidates: ${num_goal_candidates}
+    use_topology_features: ${use_topology_features}
+  pretrained_weights: ${pretrained_weights}
+  lr: ${lr}
+  weight_decay: ${weight_decay}
+  epochs: ${epochs}
+  warmup_epochs: ${warmup_epochs}
+  ws_offset: ${ws_offset}
+  num_modes: ${num_modes}
+  use_soft_multimodal: ${use_soft_multimodal}
+  top_m: ${top_m}
+  soft_tau: ${soft_tau}
+  detach_soft_weight: ${detach_soft_weight}
+  use_soft_score: ${use_soft_score}
+  use_soft_intermediate: ${use_soft_intermediate}
+  use_endpoint_diversity: ${use_endpoint_diversity}
+  div_margin: ${div_margin}
+  lambda_div: ${lambda_div}
+  lambda_score_soft: ${lambda_score_soft}
+  use_goal_loss: ${use_goal_loss}
+  lambda_goal: ${lambda_goal}
+  goal_recall_threshold: ${goal_recall_threshold}
+  laplace_scale_min: ${laplace_scale_min}
+  laplace_scale_max: ${laplace_scale_max}

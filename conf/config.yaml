@@ -1,0 +1,70 @@
+defaults:
+  - datamodule: av2
+  - model: model_forecast
+  - _self_
+  - optional experiment: null
+
+hydra:
+  run:
+    dir: outputs/${output}/${now:%Y%m%d-%H%M%S}
+
+seed: 2024
+monitor: val_minFDE6
+save_top_k: 10
+
+data_root:
+checkpoint:
+pretrained_weights:
+run2_pretrained_weights:
+output: change_${datamodule.name}_${datamodule.phase}_${model.name}_${model.phase}
+
+# trainer
+num_workers: 16
+gpus: 1  # Paper: 10x RTX A5000; test/inference: 1 GPU
+sync_bn: false
+batch_size: 160
+epochs: 60
+warmup_epochs: 10
+ws_offset: [0.0, 1.0]  # only RP2 supervised
+
+num_modes: 6
+
+# Part A: soft multimodal learning
+use_soft_multimodal: true
+top_m: 2
+soft_tau: 0.7
+detach_soft_weight: true
+use_soft_score: true
+use_soft_intermediate: true
+use_endpoint_diversity: true
+div_margin: 2.0
+lambda_div: 0.02
+lambda_score_soft: 1.0
+laplace_scale_min: 1e-3
+laplace_scale_max: 10.0
+
+# Part B: goal/topology-conditioned mode token
+use_goal_conditioned_tokens: false
+num_goal_candidates: 16
+use_topology_features: true
+use_goal_loss: false
+lambda_goal: 0.2
+goal_recall_threshold: 2.0
+
+enc_layer_1: 4
+enc_layer_2: 2
+
+dec_layer_1: 2  # TEDec: 2+4=6 CAM blocks (supplementary)
+dec_layer_2: 4
+
+# optimizer
+lr: 0.0015
+weight_decay: 1e-2  
+gradient_clip_val: 5
+gradient_clip_algorithm: norm
+
+limit_train_batches:
+limit_val_batches:
+limit_test_batches:
+log_model: all
+test: false  # false for val, true for test

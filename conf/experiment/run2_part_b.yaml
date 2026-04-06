@@ -1,0 +1,26 @@
+# @package _global_
+
+model:
+  name: run2_part_b
+  phase: goal_conditioned
+
+pretrained_weights: ${run2_pretrained_weights}
+
+use_soft_multimodal: true
+top_m: 2
+soft_tau: 0.7
+detach_soft_weight: true
+use_soft_score: true
+use_soft_intermediate: true
+use_endpoint_diversity: true
+div_margin: 2.0
+lambda_div: 0.02
+lambda_score_soft: 1.0
+laplace_scale_min: 1e-3
+laplace_scale_max: 10.0
+
+use_goal_conditioned_tokens: true
+num_goal_candidates: 16
+use_topology_features: true
+use_goal_loss: true
+lambda_goal: 0.2
