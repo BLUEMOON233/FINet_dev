@@ -35,42 +35,12 @@ class Trainer(pl.LightningModule):
         epochs: int = 60,
         weight_decay: float = 1e-2,
         ws_offset: List = [0.0, 1.0],
-        num_modes: int = 6,
-        use_soft_multimodal: bool = True,
-        top_m: int = 2,
-        soft_tau: float = 0.7,
-        detach_soft_weight: bool = True,
-        use_soft_score: bool = True,
-        use_soft_intermediate: bool = True,
-        use_endpoint_diversity: bool = True,
-        div_margin: float = 2.0,
-        lambda_div: float = 0.02,
-        lambda_score_soft: float = 1.0,
-        use_goal_loss: bool = False,
-        lambda_goal: float = 0.2,
-        goal_recall_threshold: float = 2.0,
-        laplace_scale_min: float = 1e-3,
-        laplace_scale_max: float = 10.0,
     ) -> None:
         super(Trainer, self).__init__()
         self.warmup_epochs = warmup_epochs
         self.epochs = epochs
         self.lr = lr
         self.weight_decay = weight_decay
-        self.num_modes = num_modes
-        self.use_soft_multimodal = use_soft_multimodal
-        self.top_m = top_m
-        self.soft_tau = soft_tau
-        self.detach_soft_weight = detach_soft_weight
-        self.use_soft_score = use_soft_score
-        self.use_soft_intermediate = use_soft_intermediate
-        self.use_endpoint_diversity = use_endpoint_diversity
-        self.div_margin = div_margin
-        self.lambda_div = lambda_div
-        self.lambda_score_soft = lambda_score_soft
-        self.use_goal_loss = use_goal_loss
-        self.lambda_goal = lambda_goal
-        self.goal_recall_threshold = goal_recall_threshold
         self.save_hyperparameters()
         self.submission_handler = SubmissionAv2()
 
@@ -84,25 +54,17 @@ class Trainer(pl.LightningModule):
             self.net.load_from_checkpoint(pretrained_weights)
             print('Pretrained weights have been loaded.')
 
-        top_k_eval = min(6, self.num_modes)
         metrics = MetricCollection(
             {
                 "minADE1": minADE(k=1),
-                "minADE6": minADE(k=top_k_eval),
+                "minADE6": minADE(k=6),
                 "minFDE1": minFDE(k=1),
-                "minFDE6": minFDE(k=top_k_eval),
+                "minFDE6": minFDE(k=6),
                 "MR": MR(),
-                "b-minFDE6": brier_minFDE(k=top_k_eval),
+                "b-minFDE6": brier_minFDE(k=6),
             }
         )
-        self.laplace_loss = LaplaceNLLLoss(
-            num_modes=self.num_modes,
-            top_m=self.top_m,
-            tau=self.soft_tau,
-            detach_soft_weight=self.detach_soft_weight,
-            scale_min=laplace_scale_min,
-            scale_max=laplace_scale_max,
-        )
+        self.laplace_loss = LaplaceNLLLoss()
         self.val_metrics = metrics.clone(prefix="val_")
         self.val_metrics_new = metrics.clone(prefix="val_new_")
         
@@ -111,8 +73,8 @@ class Trainer(pl.LightningModule):
         self.total_time=0
         self.cur_time = 0
 
-        self.count = np.zeros(self.num_modes)
-        self.count_closet = np.zeros(self.num_modes)
+        self.count = np.zeros(6)
+        self.count_closet = np.zeros(6)
         
     
 
@@ -134,73 +96,6 @@ class Trainer(pl.LightningModule):
             probs.append(prob)
 
         return predictions, probs
-
-    def _compute_mode_distance(self, pred: torch.Tensor, y: torch.Tensor):
-        if pred is None:
-            return None
-        if pred.dim() == 3:
-            pred_end = pred[..., :2]
-            gt_end = y[:, -1, :2]
-        else:
-            pred_end = pred[..., -1, :2]
-            gt_end = y[:, -1, :2]
-        return torch.norm(pred_end - gt_end.unsqueeze(1), dim=-1)
-
-    def _build_soft_target(self, mode_dist: torch.Tensor):
-        top_m = min(self.top_m, mode_dist.size(1))
-        top_dist, top_idx = torch.topk(mode_dist, k=top_m, dim=-1, largest=False)
-        weights = F.softmax(-top_dist / max(self.soft_tau, 1e-6), dim=-1)
-        if self.detach_soft_weight:
-            weights = weights.detach()
-        soft_target = torch.zeros_like(mode_dist)
-        soft_target.scatter_(1, top_idx, weights)
-        return soft_target
-
-    def _soft_traj_loss(self, pred: torch.Tensor, y: torch.Tensor, soft_target: torch.Tensor):
-        if pred.dim() == 3:
-            per_mode = F.smooth_l1_loss(
-                pred[..., :2], y[:, -1, :2].unsqueeze(1), reduction="none"
-            ).mean(dim=-1)
-        else:
-            per_mode = F.smooth_l1_loss(
-                pred[..., :2], y.unsqueeze(1), reduction="none"
-            ).mean(dim=(-1, -2))
-        return (soft_target * per_mode).sum(dim=-1).mean()
-
-    def _soft_cls_loss(self, logits: torch.Tensor, soft_target: torch.Tensor):
-        return -(soft_target * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
-
-    def _hard_losses(self, pred: torch.Tensor, logits: torch.Tensor, y: torch.Tensor):
-        mode_dist = self._compute_mode_distance(pred, y)
-        best_mode = torch.argmin(mode_dist, dim=-1)
-        batch_idx = torch.arange(pred.shape[0], device=pred.device)
-        if pred.dim() == 3:
-            pred_best = pred[batch_idx, best_mode]
-            reg_loss = F.smooth_l1_loss(pred_best[..., :2], y[:, -1, :2])
-        else:
-            pred_best = pred[batch_idx, best_mode]
-            reg_loss = F.smooth_l1_loss(pred_best[..., :2], y)
-        if logits is None:
-            cls_loss = reg_loss.new_tensor(0.0)
-        else:
-            cls_loss = F.cross_entropy(logits, best_mode.detach(), label_smoothing=0.2)
-        return reg_loss, cls_loss, best_mode, mode_dist
-
-    def _endpoint_diversity_loss(self, pred: torch.Tensor):
-        if pred is None:
-            return None
-        if pred.dim() == 3:
-            endpoints = pred[..., :2]
-        else:
-            endpoints = pred[..., -1, :2]
-        if endpoints.size(1) < 2:
-            return endpoints.new_tensor(0.0)
-        pair_dist = torch.cdist(endpoints, endpoints, p=2)
-        valid_pair = ~torch.eye(
-            endpoints.size(1), device=endpoints.device, dtype=torch.bool
-        ).unsqueeze(0)
-        pair_penalty = F.relu(self.div_margin - pair_dist) * valid_pair.float()
-        return pair_penalty.sum() / valid_pair.sum().clamp(min=1)
 
     def cal_loss(self, out, data, tag=''):
         y_hat, pi, y_hat_others = out["y_hat"], out["pi"], out["y_hat_others"]
@@ -242,41 +137,34 @@ class Trainer(pl.LightningModule):
         # ep_reg_loss = dense_reg_loss + F.smooth_l1_loss(ep_offsets[-1], gt_offsets)
         
 
-        soft_target = None
-        soft_target_new = None
-        if self.use_soft_multimodal and self.use_soft_intermediate:
-            mode_dist = self._compute_mode_distance(y_hat, y)
-            soft_target = self._build_soft_target(mode_dist)
-            agent_reg_loss = self._soft_traj_loss(y_hat, y, soft_target)
-            if self.use_soft_score:
-                agent_cls_loss = self.lambda_score_soft * self._soft_cls_loss(pi, soft_target)
-            else:
-                best_mode = torch.argmin(mode_dist, dim=-1)
-                agent_cls_loss = F.cross_entropy(pi, best_mode.detach(), label_smoothing=0.2)
+        if y_hat.dim() == 3:
+            # loss for output of mode query (endpoint-only, shape [B, K, 2])
+            ep = y[:,-1,:2]
+            l2_norm = torch.norm(y_hat[..., :2] - ep.unsqueeze(1), dim=-1)
+            best_mode = torch.argmin(l2_norm, dim=-1)
+            y_hat_best = y_hat[torch.arange(y_hat.shape[0]), best_mode]
+            agent_reg_loss = F.smooth_l1_loss(y_hat_best[..., :2], ep)
+            agent_cls_loss = F.cross_entropy(pi, best_mode.detach(), label_smoothing=0.2)
         else:
-            agent_reg_loss, agent_cls_loss, _, _ = self._hard_losses(y_hat, pi, y)
+            # loss for output of mode query (full trajectory, ADE-based WTA)
+            l2_norm = torch.norm(y_hat[..., :2] - y.unsqueeze(1), dim=-1).sum(dim=-1)
+            best_mode = torch.argmin(l2_norm, dim=-1)
+            y_hat_best = y_hat[torch.arange(y_hat.shape[0]), best_mode]
+            agent_reg_loss = F.smooth_l1_loss(y_hat_best[..., :2], y)
+            agent_cls_loss = F.cross_entropy(pi, best_mode.detach(), label_smoothing=0.2)
 
-        best_mode_new = None
+        # loss for final output (ADE-based WTA)
         if new_y_hat is not None:
-            if self.use_soft_multimodal:
-                mode_dist_new = self._compute_mode_distance(new_y_hat, y)
-                soft_target_new = self._build_soft_target(mode_dist_new)
-                new_agent_reg_loss = self._soft_traj_loss(new_y_hat, y, soft_target_new)
-                best_mode_new = torch.argmin(mode_dist_new, dim=-1)
-            else:
-                new_agent_reg_loss, _, best_mode_new, _ = self._hard_losses(new_y_hat, new_pi, y)
+            l2_norm_new = torch.norm(new_y_hat[..., :2] - y.unsqueeze(1), dim=-1).sum(dim=-1)
+            best_mode_new = torch.argmin(l2_norm_new, dim=-1)
+            new_y_hat_best = new_y_hat[torch.arange(new_y_hat.shape[0]), best_mode_new]
+            new_agent_reg_loss = F.smooth_l1_loss(new_y_hat_best[..., :2], y)
         else:
-            new_agent_reg_loss = y.new_tensor(0.0)
+            new_agent_reg_loss = 0
         if new_pi is not None:
-            if self.use_soft_multimodal and self.use_soft_score and soft_target_new is not None:
-                new_pi_reg_loss = self.lambda_score_soft * self._soft_cls_loss(new_pi, soft_target_new)
-            else:
-                if best_mode_new is None:
-                    mode_dist_new = self._compute_mode_distance(new_y_hat, y)
-                    best_mode_new = torch.argmin(mode_dist_new, dim=-1)
-                new_pi_reg_loss = F.cross_entropy(new_pi, best_mode_new.detach(), label_smoothing=0.2)
+            new_pi_reg_loss = F.cross_entropy(new_pi, best_mode_new.detach(), label_smoothing=0.2)
         else:
-            new_pi_reg_loss = y.new_tensor(0.0)
+            new_pi_reg_loss = 0
 
         # loss for other agents
         others_reg_mask = data["target_mask"][:, 1:]
@@ -294,51 +182,13 @@ class Trainer(pl.LightningModule):
         predictions['scale'] = scal_new
         predictions['probs'] = new_pi
         laplace_loss_new = self.laplace_loss.compute(predictions, y)
+        
 
-        div_source = new_y_hat if new_y_hat is not None else y_hat
-        if self.use_endpoint_diversity:
-            div_loss = self._endpoint_diversity_loss(div_source)
-        else:
-            div_loss = y.new_tensor(0.0)
-
-        goal_loss = y.new_tensor(0.0)
-        goal_recall = y.new_tensor(0.0)
-        goal_logits = out.get("goal_logits", None)
-        goal_candidate_xy = out.get("goal_candidate_xy", None)
-        goal_candidate_mask = out.get("goal_candidate_mask", None)
-        if (
-            self.use_goal_loss
-            and goal_logits is not None
-            and goal_candidate_xy is not None
-            and goal_candidate_mask is not None
-        ):
-            gt_endpoint = y[:, -1, :2]
-            goal_dist = torch.norm(
-                goal_candidate_xy - gt_endpoint.unsqueeze(1), dim=-1
-            )
-            goal_dist = goal_dist.masked_fill(~goal_candidate_mask, 1e9)
-            gt_goal_idx = torch.argmin(goal_dist, dim=-1)
-            goal_logits = goal_logits.masked_fill(~goal_candidate_mask, -1e9)
-            goal_loss = F.cross_entropy(goal_logits, gt_goal_idx.detach())
-            goal_recall = (
-                goal_dist.min(dim=-1).values < self.goal_recall_threshold
-            ).float().mean()
-
+                
         loss = new_agent_reg_loss + new_pi_reg_loss + laplace_loss + laplace_loss_new
         loss = loss + agent_reg_loss + agent_cls_loss + others_reg_loss + dense_reg_loss
-        loss = loss + ep_reg_loss + self.lambda_div * div_loss + self.lambda_goal * goal_loss
-
-        soft_target_log = soft_target_new if soft_target_new is not None else soft_target
-        if soft_target_log is not None and soft_target_log.size(1) > 1:
-            top_weights = torch.topk(soft_target_log, k=2, dim=-1).values
-            soft_w_top1 = top_weights[:, 0].mean()
-            soft_w_top2 = top_weights[:, 1].mean()
-        elif soft_target_log is not None:
-            soft_w_top1 = soft_target_log.max(dim=-1).values.mean()
-            soft_w_top2 = y.new_tensor(0.0)
-        else:
-            soft_w_top1 = y.new_tensor(0.0)
-            soft_w_top2 = y.new_tensor(0.0)
+        loss = loss + ep_reg_loss
+                
 
 
         disp_dict = {
@@ -348,11 +198,6 @@ class Trainer(pl.LightningModule):
             f"{tag}others_reg_loss": others_reg_loss.item(),
             f"{tag}laplace_loss": laplace_loss.item(),
             f"{tag}laplace_loss_new": laplace_loss_new.item(),
-            f"{tag}div_loss": div_loss.item(),
-            f"{tag}goal_loss": goal_loss.item(),
-            f"{tag}goal_recall": goal_recall.item(),
-            f"{tag}soft_w_top1": soft_w_top1.item(),
-            f"{tag}soft_w_top2": soft_w_top2.item(),
         }
         
         if new_y_hat is not None:
@@ -386,7 +231,29 @@ class Trainer(pl.LightningModule):
                 batch_size=bs,
             )
 
+        self._log_fallback_stats(out, tag="train", batch_size=bs)
+
         return loss
+
+    def _log_fallback_stats(self, out, tag: str, batch_size: int):
+        fallback_stats = out.get("fallback_stats", None)
+        if fallback_stats is None:
+            return
+
+        for k, v in fallback_stats.items():
+            if v is None:
+                continue
+            if not torch.is_tensor(v):
+                v = torch.tensor(float(v), device=self.device)
+            self.log(
+                f"{tag}/fallback/{k}",
+                v.detach(),
+                on_step=(tag == "train"),
+                on_epoch=True,
+                prog_bar=False,
+                sync_dist=True,
+                batch_size=batch_size,
+            )
 
     def vis_ep(self, ep, gt, prediction, save_path="/home/shijie/code/FINet_ICCV2025/FINet/Visual_ep"):
         prediction = prediction.cpu().detach().numpy()
@@ -463,6 +330,7 @@ class Trainer(pl.LightningModule):
                     batch_size=1,
                     sync_dist=True,
                 )
+            self._log_fallback_stats(out, tag="val", batch_size=1)
 
         except:
             pass

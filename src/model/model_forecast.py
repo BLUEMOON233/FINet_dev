@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from .layers.lane_embedding import LaneEmbeddingLayer
 from .layers.transformer_blocks import Block, InteractionBlock
 from .layers.time_decoder import TimeDecoder
+from .layers.structured_mode_generator import StructuredFutureModeGenerator
 from .layers.mamba.vim_mamba import init_weights, create_block
 from functools import partial
 from timm.models.layers import DropPath, to_2tuple
@@ -51,17 +52,9 @@ class ModelForecast(nn.Module):
         enc_layer_1: int = 4,
         enc_layer_2: int = 2,
         dec_layer_1: int = 2,
-        dec_layer_2: int = 4,
-        num_modes: int = 6,
-        use_goal_conditioned_tokens: bool = False,
-        num_goal_candidates: int = 16,
-        use_topology_features: bool = True,
+        dec_layer_2: int = 4
     ) -> None:
         super().__init__()
-        self.num_modes = num_modes
-        self.use_goal_conditioned_tokens = use_goal_conditioned_tokens
-        self.num_goal_candidates = num_goal_candidates
-        self.use_topology_features = use_topology_features
 
         self.hist_embed_mlp = nn.Sequential(
             nn.Linear(4, 64),
@@ -145,17 +138,12 @@ class ModelForecast(nn.Module):
         self.decoder0 = MultimodalDecoder(embed_dim)
         
         self.future_steps = future_steps
-        self.tokens = nn.Parameter(torch.randn(1, self.num_modes, embed_dim))
-        self.goal_input_dim = 10
-        self.goal_encoder = nn.Sequential(
-            nn.Linear(self.goal_input_dim, embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, embed_dim),
-        )
-        self.goal_scorer = nn.Sequential(
-            nn.Linear(embed_dim * 2, embed_dim),
-            nn.GELU(),
-            nn.Linear(embed_dim, 1),
+        self.mode_generator = StructuredFutureModeGenerator(
+            embed_dim=embed_dim,
+            top_ng=3,
+            num_social=2,
+            num_modes=6,
+            social_topk=8,
         )
 
         self.initialize_weights()
@@ -185,119 +173,46 @@ class ModelForecast(nn.Module):
         }
         return self.load_state_dict(state_dict=state_dict, strict=False)
 
-    @staticmethod
-    def _gather_by_index(src: torch.Tensor, idx: torch.Tensor):
-        view_shape = list(idx.shape) + [1] * (src.dim() - 2)
-        expand_shape = list(idx.shape) + list(src.shape[2:])
-        gather_idx = idx.view(*view_shape).expand(*expand_shape)
-        return torch.gather(src, dim=1, index=gather_idx)
 
-    def _build_goal_tokens(self, data: dict, ego_feat: torch.Tensor):
-        lane_centers = data["lane_centers"]
-        lane_angles = data["lane_angles"]
-        lane_attr = data["lane_attr"]
-        lane_positions = data["lane_positions"]
-        lane_mask = data["lane_key_valid_mask"]
-        ego_center = data["x_centers"][:, 0]
-        ego_heading = data["x_angles"][:, 0, -1]
-
-        batch_size, num_lanes, _ = lane_centers.shape
-        num_candidates = min(self.num_goal_candidates, num_lanes)
-        if num_candidates <= 0:
-            mode_tokens = self.tokens.expand(batch_size, -1, -1)
-            return {
-                "future_mode_tokens": mode_tokens,
-                "goal_logits": None,
-                "goal_candidate_xy": None,
-                "goal_candidate_mask": None,
-                "goal_topk_idx": None,
-            }
-
-        dist_to_ego = torch.norm(lane_centers - ego_center.unsqueeze(1), dim=-1)
-        heading_align = torch.cos(lane_angles - ego_heading.unsqueeze(1))
-        rank_score = heading_align - 0.02 * dist_to_ego
-        rank_score = rank_score.masked_fill(~lane_mask, -1e9)
-        candidate_idx = torch.topk(rank_score, k=num_candidates, dim=-1).indices
-
-        candidate_xy = self._gather_by_index(lane_centers, candidate_idx)
-        candidate_heading = self._gather_by_index(lane_angles.unsqueeze(-1), candidate_idx).squeeze(-1)
-        candidate_attr = self._gather_by_index(lane_attr, candidate_idx)
-        candidate_pos = self._gather_by_index(lane_positions, candidate_idx)
-        candidate_mask = self._gather_by_index(lane_mask.unsqueeze(-1), candidate_idx).squeeze(-1)
-
-        no_valid = ~candidate_mask.any(dim=-1)
-        if no_valid.any():
-            candidate_mask = candidate_mask.clone()
-            candidate_xy = candidate_xy.clone()
-            candidate_heading = candidate_heading.clone()
-            candidate_attr = candidate_attr.clone()
-            candidate_pos = candidate_pos.clone()
-            candidate_mask[no_valid, 0] = True
-            candidate_xy[no_valid, 0] = ego_center[no_valid]
-            candidate_heading[no_valid, 0] = ego_heading[no_valid]
-            candidate_attr[no_valid, 0] = 0
-            candidate_pos[no_valid, 0] = 0
-
-        curvature = torch.norm(
-            candidate_pos[:, :, -1] - 2 * candidate_pos[:, :, candidate_pos.size(2) // 2] + candidate_pos[:, :, 0],
-            dim=-1,
-        )
-        lane_type = candidate_attr[..., 0]
-        lane_width = candidate_attr[..., 1]
-        is_intersection = candidate_attr[..., 2]
-        if not self.use_topology_features:
-            lane_type = torch.zeros_like(lane_type)
-            is_intersection = torch.zeros_like(is_intersection)
-
-        dist_goal = torch.norm(candidate_xy - ego_center.unsqueeze(1), dim=-1)
-        heading_goal_align = torch.cos(candidate_heading - ego_heading.unsqueeze(1))
-        goal_feat = torch.stack(
-            [
-                candidate_xy[..., 0],
-                candidate_xy[..., 1],
-                torch.sin(candidate_heading),
-                torch.cos(candidate_heading),
-                dist_goal,
-                heading_goal_align,
-                curvature,
-                lane_width,
-                lane_type / 2.0,
-                is_intersection,
-            ],
-            dim=-1,
-        )
-
-        goal_embed = self.goal_encoder(goal_feat)
-        ego_expand = ego_feat.unsqueeze(1).expand(-1, num_candidates, -1)
-        goal_logits = self.goal_scorer(torch.cat([goal_embed, ego_expand], dim=-1)).squeeze(-1)
-        goal_logits = goal_logits.masked_fill(~candidate_mask, -1e9)
-
-        select_k = min(self.num_modes, num_candidates)
-        goal_topk_idx = torch.topk(goal_logits, k=select_k, dim=-1).indices
-        selected_goal_embed = self._gather_by_index(goal_embed, goal_topk_idx)
-
-        if select_k < self.num_modes:
-            pad_shape = (batch_size, self.num_modes - select_k, selected_goal_embed.size(-1))
-            selected_goal_embed = torch.cat(
-                [selected_goal_embed, selected_goal_embed.new_zeros(pad_shape)], dim=1
-            )
-
-        mode_tokens = self.tokens.expand(batch_size, -1, -1)
-        future_mode_tokens = mode_tokens + selected_goal_embed
-
-        return {
-            "future_mode_tokens": future_mode_tokens,
-            "goal_logits": goal_logits,
-            "goal_candidate_xy": candidate_xy,
-            "goal_candidate_mask": candidate_mask,
-            "goal_topk_idx": goal_topk_idx,
-        }
-
-    def spatial_mamba(self, x_encoder, x_centers, future_mode_tokens=None):
+    def spatial_mamba(
+        self,
+        x_encoder,
+        x_centers,
+        num_agents,
+        x_angles=None,
+        lane_angles=None,
+        lane_attr=None,
+        agent_valid_mask=None,
+        lane_valid_mask=None,
+    ):
         ep_offset_1, ep_tok_1 = self.decoder0(x_encoder[:,0])
         # ep_offset_1 = ep_offset_1.detach()
 
-        valid_mask = (x_centers.sum(-1) != 0)
+        # structured future mode generation
+        # agent_feat: [B, N, D], lane_feat: [B, M, D]
+        # fut_tok: [B, 6, D]
+        agent_feat = x_encoder[:, :num_agents]
+        lane_feat = x_encoder[:, num_agents:]
+        agent_centers = x_centers[:, :num_agents]
+        lane_centers = x_centers[:, num_agents:]
+        fut_tok, aux_mode = self.mode_generator(
+            focal_feat=agent_feat[:, 0],
+            agent_feat=agent_feat,
+            lane_feat=lane_feat,
+            x_centers=agent_centers,
+            lane_centers=lane_centers,
+            x_angles=x_angles,
+            lane_angles=lane_angles,
+            lane_attr=lane_attr,
+            agent_valid_mask=agent_valid_mask,
+            lane_valid_mask=lane_valid_mask,
+            goal_bias=ep_offset_1,  # decoder0 endpoint bias for goal proposal
+        )
+
+        if agent_valid_mask is not None and lane_valid_mask is not None:
+            valid_mask = torch.cat([agent_valid_mask, lane_valid_mask], dim=1)
+        else:
+            valid_mask = (x_centers.sum(-1) != 0)
         valid_mask[:,0] = True
         
         center = x_centers[:,0] + ep_offset_1
@@ -308,11 +223,7 @@ class ModelForecast(nn.Module):
 
         x_encoder = torch.gather(x_encoder, 1, indexes.unsqueeze(-1).expand(-1, -1, x_encoder.size(2)))
         
-        fut_tok = x_encoder[:,-1:].clone()
-        if future_mode_tokens is None:
-            fut_tok = fut_tok + self.tokens
-        else:
-            fut_tok = fut_tok + future_mode_tokens
+        # keep original endpoint token update path for first mode
         fut_tok = torch.cat([fut_tok[:,:1] + ep_tok_1.unsqueeze(1), fut_tok[:,1:]], 1)
 
         x_encoder = torch.cat([x_encoder, fut_tok], 1)
@@ -333,8 +244,8 @@ class ModelForecast(nn.Module):
             residual_in_fp32=True  
         ) # [421, 50, 128]
 
-        fut_tok = x_encoder[:, -self.num_modes:]
-        x_encoder = x_encoder[:, :-self.num_modes]
+        fut_tok = x_encoder[:, -6:]
+        x_encoder = x_encoder[:, :-6]
 
         x_encoder = torch.scatter(x_encoder, 1, indexes.unsqueeze(-1).expand(-1, -1, x_encoder.size(2)), x_encoder)
 
@@ -370,12 +281,12 @@ class ModelForecast(nn.Module):
             prenorm=False,
             residual_in_fp32=True  
         ) # [421, 50, 128]
-        fut_tok = x_encoder[:, -self.num_modes:]
-        x_encoder = x_encoder[:, :-self.num_modes]
+        fut_tok = x_encoder[:, -6:]
+        x_encoder = x_encoder[:, :-6]
         
         # #! query-base cross-attention
         x_encoder = torch.scatter(x_encoder, 1, indexes.unsqueeze(-1).expand(-1, -1, x_encoder.size(2)), x_encoder)
-        return x_encoder, fut_tok, [ep_offset_1, ep_offset_2]
+        return x_encoder, fut_tok, [ep_offset_1, ep_offset_2], aux_mode
         # return x_encoder, fut_tok, [ep_offset_2]
 
 
@@ -455,20 +366,18 @@ class ModelForecast(nn.Module):
         ) # [16, 173]
 
         x_encoder = x_encoder + pos_embed # [16, 173, 128]
+        
+        
 
-        goal_context = {
-            "goal_logits": None,
-            "goal_candidate_xy": None,
-            "goal_candidate_mask": None,
-            "goal_topk_idx": None,
-        }
-        future_mode_tokens = None
-        if self.use_goal_conditioned_tokens:
-            goal_context = self._build_goal_tokens(data, x_encoder[:, 0])
-            future_mode_tokens = goal_context["future_mode_tokens"]
-
-        x_encoder, mode, ep_offsets = self.spatial_mamba(
-            x_encoder, x_centers, future_mode_tokens=future_mode_tokens
+        x_encoder, mode, ep_offsets, aux_mode = self.spatial_mamba(
+            x_encoder,
+            x_centers,
+            num_agents=N,
+            x_angles=data["x_angles"][:, :, -1],
+            lane_angles=data["lane_angles"],
+            lane_attr=data.get("lane_attr", None),
+            agent_valid_mask=data.get("x_key_valid_mask", None),
+            lane_valid_mask=data.get("lane_key_valid_mask", None),
         )
         x_encoder = self.norm(x_encoder) # [16, 173, 128]
 
@@ -498,10 +407,13 @@ class ModelForecast(nn.Module):
             "new_y_hat": new_y_hat,  # final trajectory output
             "new_pi": new_pi,  # final probability output     
             "scal_new": scal_new,  # final output for Laplace loss
-            "goal_logits": goal_context["goal_logits"],
-            "goal_candidate_xy": goal_context["goal_candidate_xy"],
-            "goal_candidate_mask": goal_context["goal_candidate_mask"],
-            "goal_topk_idx": goal_context["goal_topk_idx"],
+
+            # auxiliary outputs for structured future modes
+            "goal_scores": aux_mode.get("goal_scores", None) if aux_mode is not None else None,
+            "goal_xy": aux_mode.get("goal_xy", None) if aux_mode is not None else None,
+            "social_logits": aux_mode.get("social_logits", None) if aux_mode is not None else None,
+            "fallback_stats": aux_mode.get("fallback_stats", None) if aux_mode is not None else None,
+            
         }
 
 

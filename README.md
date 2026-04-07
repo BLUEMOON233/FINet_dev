@@ -1,92 +1,105 @@
-# [**Future-Aware Interaction Network For Motion Forecasting (ICCV2025)**](https://arxiv.org/pdf/2503.06565)
+# FINet 结构化 Future Modes 改造说明（覆盖版）
 
-## Abstract
-Motion forecasting is a crucial component of autonomous driving systems, enabling the generation of accurate and smooth future trajectories to ensure safe navigation to the destination. In previous methods, potential future trajectories are often absent in the scene encoding stage, which may lead to suboptimal outcomes. Additionally, prior approaches typically employ transformer architectures for spatiotemporal modeling of trajectories and map information, which suffer from the quadratic scaling complexity of the transformer architecture. In this work, we propose an interaction-based method, named Future-Aware Interaction Network, that introduces potential future trajectories into scene encoding for a comprehensive traffic representation. Furthermore, a State Space Model (SSM), specifically Mamba, is introduced for both spatial and temporal modeling. To adapt Mamba for spatial interaction modeling, we propose an adaptive reordering strategy that transforms unordered data into a structured sequence. Additionally, Mamba is employed to refine generated future trajectories temporally, ensuring more consistent predictions. These enhancements not only improve model efficiency but also enhance the accuracy and diversity of predictions. We conduct comprehensive experiments on the widely used Argoverse 1 and Argoverse 2 datasets, demonstrating that the proposed method achieves superior performance compared to previous approaches in a more efficient way. The code will be released according to the acceptance.
+更新时间：2026-04-07
 
-## Pipeline
-<div align="center">
-  <img src="assets/main.png"/>
-</div><br/>
+本 README 为本次改造工作的**完整说明**，已覆盖旧内容。
 
-## Install
-```
-conda create -n FINet python=3.10
-conda activate FINet
-pip install -r requirements.txt
-cd mamba_modules/causal-conv1d
-pip install -v --no-build-isolation .
-cd ../mamba
-pip install -v --no-build-isolation .
-```
+## 改造目标
 
+在不推翻 FINet 主干结构的前提下，将 `future token generator` 从：
 
+- `focal token + fixed learnable tokens`
 
-## Prepare the data (AV2)
-Download data at [**link**](https://www.argoverse.org/av2.html)
-### AV2 Data Structure
-```
-data_root
-    ├── train
-    │   ├── 0000b0f9-99f9-4a1f-a231-5be9e4c523f7
-    │   ├── 0000b6ab-e100-4f6b-aee8-b520b57c0530
-    │   ├── ...
-    ├── val
-    │   ├── 00010486-9a07-48ae-b493-cf4545855937
-    │   ├── 00062a32-8d6d-4449-9948-6fedac67bfcd
-    │   ├── ...
-    ├── test
-    │   ├── 0000b329-f890-4c2b-93f2-7e2413d4ca5b
-    │   ├── 0008c251-e9b0-4708-b762-b15cb6effc27
-    │   ├── ...
-```
+升级为：
 
-### Preprocess
-```
-python preprocess.py --data_root=/path/to/data_root -p
-```
+- `goal-conditioned + branch-conditioned + social-response-conditioned`
 
-### The structure of the dataset after processing
-```
-└── data
-    └── processed
-        ├── train
-        ├── val
-        └── test
-```
+即结构化未来模式生成（Structured Future Modes）。
 
-## Training and testing
-```
-# Train
-python train.py 
+## 已完成工作
 
-# Evaluation
-python eval.py
+### 1) 新增 Structured Mode Generator 模块
 
-# Test for submission
-python eval.py gpus=1 test=true
-```
+新增文件：`src/model/layers/structured_mode_generator.py`
 
-### Two-run recipe (soft multimodal -> goal-conditioned token)
-```
-# Run-1: Part A (replace WTA with soft top-2 multimodal learning)
-python train.py experiment=run1_part_a
+包含 4 个核心类：
 
-# Run-2: Part B (start from Run-1 checkpoint, enable goal/topology-conditioned mode token)
-python train.py experiment=run2_part_b run2_pretrained_weights=/path/to/run1.ckpt
-```
+- `GoalProposalHead`
+  - 输入：focal feature + lane feature/center/attr/angle
+  - 输出：`top_ng=3` 个 goals（`goal_feat / goal_scores / goal_xy`）
+- `BranchPooler`
+  - 基于 goal 与 lane 上下文做软分支池化
+  - 输出：`branch_feat / branch_scores`
+- `SocialResponseHead`
+  - 基于 goal/branch + 邻车特征生成 2 个 social responses
+  - 输出：`social_embed / social_logits`
+- `StructuredFutureModeGenerator`
+  - 组合 `h_f, g_m, b_m, s_m` 生成 `K=6` mode tokens
+  - 公式：`q_m = proj([h_f, g_m, b_m, s_m])`
 
-### Qualitative Results
-<div align="center">
-  <img src="assets/visual.png"/>
-</div><br/>
+### 2) 接入 ModelForecast（最小侵入式）
 
-## Reference
-```bibtex
-@inproceedings{li2025future,
-  title={Future-Aware Interaction Network For Motion Forecasting},
-  author={Li, Shijie and Liu, Chunyu and Xu, Xun and Yeo, Si Yong and Yang, Xulei},
-  booktitle={Proceedings of the IEEE/CVF International Conference on Computer Vision},
-  pages={7505--7515},
-  year={2025}
-}
-```
+修改文件：`src/model/model_forecast.py`
+
+- 删除原固定 token 参数：
+  - `self.tokens = nn.Parameter(torch.randn(1, 6, 128))`
+- 新增：
+  - `self.mode_generator = StructuredFutureModeGenerator(...)`
+- 在 `spatial_mamba()` 中替换 `fut_tok` 生成逻辑：
+  - 使用 `self.mode_generator(...)` 直接生成 `[B, 6, D]`
+  - 第一轮 `decoder0` 的 `ep_offset_1` 已作为 goal proposal bias 接入
+- 保留主干流程：
+  - `decoder0 / decoder1`
+  - 两轮 ARS / 两轮 samba blocks
+  - `TimeDecoder` 主体
+- 保持原输出接口不变，并新增辅助输出：
+  - 新增：`goal_scores / goal_xy / social_logits / fallback_stats`
+
+### 3) 训练侧日志接入
+
+修改文件：`src/model/trainer_forecast.py`
+
+- 新增 `_log_fallback_stats(...)`
+- 在 `training_step` 和 `validation_step` 自动记录 fallback 概率日志
+
+## Fallback 监控（新增）
+
+为了监控 fallback 触发频率、判断新增结构模块是否真实使用了有效信息，已新增运行期统计。
+
+### 日志前缀
+
+- `train/fallback/*`
+- `val/fallback/*`
+
+### 统计指标
+
+- `batch_*_prob`：当前 batch 的触发概率
+- `running_*_prob`：从训练开始到当前 step 的累计触发概率
+
+### 已监控项
+
+- `lane_valid_mask_missing`
+- `agent_valid_mask_missing`
+- `lane_attr_missing`
+- `lane_angles_missing`
+- `x_angles_missing`
+- `goal_padding_used`（lane 数不足 `top_ng`）
+- `social_topk_truncated`（agent 数不足 `social_topk`）
+- `no_valid_neighbors`（social 头没有可用邻车）
+
+### 结果解释建议
+
+- 若 `running_*_prob` 长期接近 0：说明 fallback 很少触发，结构化信息链路基本有效。
+- 若某一项长期偏高：说明对应输入字段经常缺失或候选不足，建议优先排查该数据链路。
+
+## 修改文件清单
+
+### 新增
+
+- `src/model/layers/structured_mode_generator.py`
+
+### 修改
+
+- `src/model/model_forecast.py`
+- `src/model/trainer_forecast.py`
+- `README.md`

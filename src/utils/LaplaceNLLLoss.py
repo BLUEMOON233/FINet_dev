@@ -28,56 +28,37 @@ class LaplaceNLLLoss(Metric):
     """
     Negative log likelihood loss for ground truth goal nodes under predicted goal log-probabilities.
     """
-    def __init__(
-        self,
-        num_modes: int = 6,
-        top_m: int = 2,
-        tau: float = 0.7,
-        detach_soft_weight: bool = True,
-        scale_min: float = 1e-3,
-        scale_max: float = 10.0,
-        cls_weight: float = 0.5,
-    ):
+    def __init__(self):
         self.name = 'LaplaceNLLLoss'
         self.loss = nn.SmoothL1Loss(reduction='mean')
-        self.num_modes = num_modes
-        self.top_m = top_m
-        self.tau = tau
-        self.detach_soft_weight = detach_soft_weight
-        self.scale_min = scale_min
-        self.scale_max = scale_max
-        self.cls_weight = cls_weight
-
-    def _build_soft_targets(self, mode_dist: torch.Tensor) -> torch.Tensor:
-        top_m = min(self.top_m, mode_dist.size(1))
-        top_dist, top_idx = torch.topk(mode_dist, k=top_m, dim=-1, largest=False)
-        weights = F.softmax(-top_dist / max(self.tau, 1e-6), dim=-1)
-        if self.detach_soft_weight:
-            weights = weights.detach()
-        soft_target = torch.zeros_like(mode_dist)
-        soft_target.scatter_(1, top_idx, weights)
-        return soft_target
 
     def compute(self, predictions: Dict, ground_truth: Union[torch.Tensor, Dict]) -> torch.Tensor:
-        out_mu = predictions['traj']
-        out_sigma = predictions['scale']
-        out_pi = predictions['probs']
-        gt = ground_truth
+        out_mu = predictions['traj']  
+        out_sigma = predictions['scale']  
+        gt = ground_truth  
+        y = gt.repeat(6, 1, 1, 1).transpose(0, 1)
+        
+        out_pi = predictions['probs']  
+        pred = torch.cat((out_mu, out_sigma), dim=-1)  
+        l2_norm = torch.norm(out_mu - y, p=2, dim=-1)  
+        l2_norm = l2_norm.sum(dim=-1)  
+        best_mode = l2_norm.argmin(dim=1)  
+        pred_best = pred[torch.arange(pred.shape[0]), best_mode]  
+        soft_target = F.softmax(-l2_norm / pred.shape[2], dim=1).detach()  
 
-        if out_mu is None or out_sigma is None or out_pi is None:
-            return gt.new_tensor(0.0)
+        loc, scale = pred_best.chunk(2, dim=-1)
+        
+        scale = scale.clone()
+        with torch.no_grad():
+            scale.clamp_(min=1e-6)
+        loss = 0
+        for b in range(loc.shape[0]):
+            nll = torch.log(2 * scale[b]) + torch.abs(gt[b] - loc[b]) / scale[b]  
+            nll_mean = nll.mean()  
 
-        gt_expanded = gt.unsqueeze(1)
-        mode_dist = torch.norm(
-            out_mu[..., -1, :2] - gt_expanded[..., -1, :2], p=2, dim=-1
-        )
-        soft_target = self._build_soft_targets(mode_dist)
+            cross_entropy = torch.sum(-soft_target[b] * F.log_softmax(out_pi[b], dim=-1), dim=-1)  
 
-        scale = out_sigma.clamp(min=self.scale_min, max=self.scale_max)
-        nll = torch.log(2 * scale) + torch.abs(gt_expanded - out_mu) / scale
-        nll_per_mode = nll.mean(dim=(-1, -2))
-        nll_loss = (soft_target * nll_per_mode).sum(dim=-1).mean()
+            loss += nll_mean + cross_entropy * 0.5
+        loss_total = loss / loc.shape[0]
 
-        cls_loss = -(soft_target * F.log_softmax(out_pi, dim=-1)).sum(dim=-1).mean()
-
-        return nll_loss + self.cls_weight * cls_loss
+        return loss_total
