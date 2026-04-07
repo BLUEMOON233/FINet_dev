@@ -93,6 +93,17 @@ class GoalProposalHead(nn.Module):
         bias_center: Optional[torch.Tensor] = None,  # [B, 2]
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, num_lanes, dim = lane_feat.shape
+        if num_lanes == 0:
+            # Safe fallback when no lane tokens are available in current scene.
+            # Keep finite outputs so downstream pipeline can continue training/inference.
+            goal_scores = focal_feat.new_zeros(bsz, self.top_ng)
+            base_xy = bias_center if bias_center is not None else focal_center
+            goal_xy = base_xy.unsqueeze(1).expand(-1, self.top_ng, -1).contiguous()
+            goal_lane_ctx = focal_feat.new_zeros(bsz, self.top_ng, dim)
+            focal_expand = focal_feat.unsqueeze(1).expand(-1, self.top_ng, -1)
+            goal_feat = self.goal_proj(torch.cat([goal_lane_ctx, focal_expand], dim=-1))
+            return goal_feat, goal_scores, goal_xy
+
         top_k = max(1, min(self.top_ng, num_lanes))
 
         if lane_valid_mask is None:
@@ -195,6 +206,12 @@ class BranchPooler(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         bsz, num_goals, dim = goal_feat.shape
         num_lanes = lane_feat.size(1)
+        if num_lanes == 0:
+            # Safe fallback for lane-empty scenes.
+            branch_ctx = goal_feat.new_zeros(bsz, num_goals, dim)
+            branch_feat = self.branch_proj(torch.cat([goal_feat, branch_ctx], dim=-1))
+            branch_scores = goal_feat.new_zeros(bsz, num_goals)
+            return branch_feat, branch_scores
 
         if lane_valid_mask is None:
             lane_valid_mask = lane_centers.abs().sum(dim=-1) > 0

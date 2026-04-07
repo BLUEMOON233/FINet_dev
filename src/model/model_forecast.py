@@ -52,7 +52,11 @@ class ModelForecast(nn.Module):
         enc_layer_1: int = 4,
         enc_layer_2: int = 2,
         dec_layer_1: int = 2,
-        dec_layer_2: int = 4
+        dec_layer_2: int = 4,
+        mode_top_ng: int = 3,
+        mode_num_social: int = 2,
+        mode_num_modes: int = 6,
+        mode_social_topk: int = 8,
     ) -> None:
         super().__init__()
 
@@ -138,12 +142,13 @@ class ModelForecast(nn.Module):
         self.decoder0 = MultimodalDecoder(embed_dim)
         
         self.future_steps = future_steps
+        self.mode_num_modes = mode_num_modes
         self.mode_generator = StructuredFutureModeGenerator(
             embed_dim=embed_dim,
-            top_ng=3,
-            num_social=2,
-            num_modes=6,
-            social_topk=8,
+            top_ng=mode_top_ng,
+            num_social=mode_num_social,
+            num_modes=mode_num_modes,
+            social_topk=mode_social_topk,
         )
 
         self.initialize_weights()
@@ -244,8 +249,8 @@ class ModelForecast(nn.Module):
             residual_in_fp32=True  
         ) # [421, 50, 128]
 
-        fut_tok = x_encoder[:, -6:]
-        x_encoder = x_encoder[:, :-6]
+        fut_tok = x_encoder[:, -self.mode_num_modes:]
+        x_encoder = x_encoder[:, :-self.mode_num_modes]
 
         x_encoder = torch.scatter(x_encoder, 1, indexes.unsqueeze(-1).expand(-1, -1, x_encoder.size(2)), x_encoder)
 
@@ -281,8 +286,8 @@ class ModelForecast(nn.Module):
             prenorm=False,
             residual_in_fp32=True  
         ) # [421, 50, 128]
-        fut_tok = x_encoder[:, -6:]
-        x_encoder = x_encoder[:, :-6]
+        fut_tok = x_encoder[:, -self.mode_num_modes:]
+        x_encoder = x_encoder[:, :-self.mode_num_modes]
         
         # #! query-base cross-attention
         x_encoder = torch.scatter(x_encoder, 1, indexes.unsqueeze(-1).expand(-1, -1, x_encoder.size(2)), x_encoder)

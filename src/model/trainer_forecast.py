@@ -35,6 +35,9 @@ class Trainer(pl.LightningModule):
         epochs: int = 60,
         weight_decay: float = 1e-2,
         ws_offset: List = [0.0, 1.0],
+        goal_tau: float = None,
+        lambda_goal_cls: float = None,
+        lambda_goal_reg: float = None,
     ) -> None:
         super(Trainer, self).__init__()
         self.warmup_epochs = warmup_epochs
@@ -43,6 +46,13 @@ class Trainer(pl.LightningModule):
         self.weight_decay = weight_decay
         self.save_hyperparameters()
         self.submission_handler = SubmissionAv2()
+
+        # copy mutable config to avoid side effects
+        model = dict(model)
+        # optional compatibility: allow putting goal loss hparams under model cfg
+        model_goal_tau = model.pop('goal_tau', None)
+        model_lambda_goal_cls = model.pop('lambda_goal_cls', None)
+        model_lambda_goal_reg = model.pop('lambda_goal_reg', None)
 
         self.model_type = model.pop('type')
         assert self.model_type in model_dict
@@ -72,6 +82,28 @@ class Trainer(pl.LightningModule):
 
         self.total_time=0
         self.cur_time = 0
+        self.test_step_count = 0
+        self.val_exception_count = 0
+
+        # goal auxiliary loss weights (with safe defaults / fallback)
+        self.goal_tau = self._resolve_loss_hparam(
+            primary=goal_tau,
+            secondary=model_goal_tau,
+            default=2.0,
+            min_value=1e-3,
+        )
+        self.lambda_goal_cls = self._resolve_loss_hparam(
+            primary=lambda_goal_cls,
+            secondary=model_lambda_goal_cls,
+            default=0.1,
+            min_value=0.0,
+        )
+        self.lambda_goal_reg = self._resolve_loss_hparam(
+            primary=lambda_goal_reg,
+            secondary=model_lambda_goal_reg,
+            default=0.05,
+            min_value=0.0,
+        )
 
         self.count = np.zeros(6)
         self.count_closet = np.zeros(6)
@@ -97,6 +129,218 @@ class Trainer(pl.LightningModule):
 
         return predictions, probs
 
+    @staticmethod
+    def _resolve_loss_hparam(
+        primary,
+        secondary,
+        default: float,
+        min_value: float = 0.0,
+    ) -> float:
+        value = primary if primary is not None else secondary
+        if value is None:
+            value = default
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            value = float(default)
+        return max(value, min_value)
+
+    def get_gt_endpoint(self, y_gt: torch.Tensor, y_mask: torch.Tensor = None):
+        """
+        Extract GT endpoint from future trajectory:
+        1) use last valid future point if mask is provided;
+        2) fallback to last timestep otherwise.
+        """
+        if y_gt is None or not torch.is_tensor(y_gt):
+            return None, None
+
+        if y_gt.dim() == 2 and y_gt.size(-1) >= 2:
+            gt_endpoint = y_gt[..., :2]
+            endpoint_valid = torch.isfinite(gt_endpoint).all(dim=-1)
+            return gt_endpoint, endpoint_valid
+
+        if y_gt.dim() < 3 or y_gt.size(1) <= 0:
+            return None, None
+
+        fallback_endpoint = y_gt[:, -1, :2]
+        bsz = y_gt.size(0)
+        device = y_gt.device
+
+        valid_mask = None
+        if y_mask is not None and torch.is_tensor(y_mask):
+            valid_mask = y_mask.bool()
+            future_steps = y_gt.size(1)
+
+            # normalize mask to [B, T] for robust endpoint extraction
+            # supports shapes like [B, T], [B, T, C], [B, A, T], [B, A, T, C]
+            if valid_mask.dim() == 2:
+                if valid_mask.size(1) != future_steps:
+                    if (
+                        valid_mask.size(0) == future_steps
+                        and valid_mask.size(1) == y_gt.size(0)
+                    ):
+                        valid_mask = valid_mask.transpose(0, 1)
+                    else:
+                        valid_mask = None
+            elif valid_mask.dim() >= 3:
+                time_dim = None
+                for dim_i in range(1, valid_mask.dim()):
+                    if valid_mask.size(dim_i) == future_steps:
+                        time_dim = dim_i
+                        break
+                if time_dim is None:
+                    valid_mask = None
+                else:
+                    if time_dim != 1:
+                        perm = [0, time_dim] + [d for d in range(1, valid_mask.dim()) if d != time_dim]
+                        valid_mask = valid_mask.permute(*perm)
+                    reduce_dims = tuple(range(2, valid_mask.dim()))
+                    if len(reduce_dims) > 0:
+                        valid_mask = valid_mask.any(dim=reduce_dims)
+            else:
+                valid_mask = None
+
+        if valid_mask is not None and valid_mask.dim() == 2:
+            has_valid = valid_mask.any(dim=-1)
+            time_idx = torch.arange(valid_mask.size(1), device=device).unsqueeze(0)
+            time_idx = time_idx.expand(valid_mask.size(0), -1)
+            masked_idx = torch.where(
+                valid_mask,
+                time_idx,
+                torch.full_like(time_idx, -1),
+            )
+            last_valid_idx = masked_idx.max(dim=-1).values.clamp_min(0)
+            batch_idx = torch.arange(bsz, device=device)
+            gathered_endpoint = y_gt[batch_idx, last_valid_idx, :2]
+            gt_endpoint = torch.where(
+                has_valid.unsqueeze(-1), gathered_endpoint, fallback_endpoint
+            )
+            endpoint_valid = has_valid
+        else:
+            gt_endpoint = fallback_endpoint
+            endpoint_valid = torch.ones(bsz, dtype=torch.bool, device=device)
+
+        endpoint_valid = endpoint_valid & torch.isfinite(gt_endpoint).all(dim=-1)
+        return gt_endpoint, endpoint_valid
+
+    def _compute_goal_cls_loss(
+        self,
+        goal_xy: torch.Tensor,
+        goal_scores: torch.Tensor,
+        gt_endpoint: torch.Tensor,
+        valid_mask: torch.Tensor = None,
+        tau: float = None,
+    ):
+        """
+        Soft responsibility supervision:
+          r_i = softmax(-d_i / tau), d_i = ||goal_xy_i - gt_endpoint||_2
+          L_goal_cls = -sum_i r_i * log softmax(goal_scores_i)
+        """
+        if gt_endpoint is None or not torch.is_tensor(gt_endpoint):
+            return None, None, None
+        zero = gt_endpoint.new_zeros(())
+
+        # fallback when auxiliary outputs are absent / malformed
+        if (
+            goal_xy is None
+            or goal_scores is None
+            or (not torch.is_tensor(goal_xy))
+            or (not torch.is_tensor(goal_scores))
+            or goal_xy.dim() != 3
+            or goal_scores.dim() != 2
+            or goal_xy.size(0) != gt_endpoint.size(0)
+            or goal_scores.size(0) != gt_endpoint.size(0)
+        ):
+            return zero, None, None
+
+        num_goals = min(goal_xy.size(1), goal_scores.size(1))
+        if num_goals <= 0:
+            return zero, None, None
+
+        goal_xy = goal_xy[:, :num_goals, :2]
+        goal_scores = goal_scores[:, :num_goals]
+        gt_endpoint = gt_endpoint[:, :2]
+
+        if valid_mask is None:
+            valid_mask = torch.ones(
+                gt_endpoint.size(0), dtype=torch.bool, device=gt_endpoint.device
+            )
+        else:
+            valid_mask = valid_mask.bool()
+
+        finite_goal_xy = torch.isfinite(goal_xy).all(dim=-1).all(dim=-1)
+        finite_goal_scores = torch.isfinite(goal_scores).all(dim=-1)
+        finite_gt = torch.isfinite(gt_endpoint).all(dim=-1)
+        valid_mask = valid_mask & finite_goal_xy & finite_goal_scores & finite_gt
+        if not valid_mask.any():
+            return zero, None, valid_mask
+
+        tau = self.goal_tau if tau is None else max(float(tau), 1e-3)
+        dist = torch.norm(goal_xy - gt_endpoint.unsqueeze(1), dim=-1)  # [B, G]
+        responsibility = torch.softmax(-dist / tau, dim=-1)  # [B, G]
+        log_probs = F.log_softmax(goal_scores, dim=-1)  # [B, G]
+
+        cls_per_sample = -(responsibility * log_probs).sum(dim=-1)  # [B]
+        cls_loss = cls_per_sample[valid_mask].mean()
+        cls_loss = torch.nan_to_num(cls_loss, nan=0.0, posinf=0.0, neginf=0.0)
+        return cls_loss, responsibility, valid_mask
+
+    def _compute_goal_reg_loss(
+        self,
+        goal_xy: torch.Tensor,
+        gt_endpoint: torch.Tensor,
+        responsibility: torch.Tensor,
+        valid_mask: torch.Tensor = None,
+    ):
+        """
+        Intermediate proposal supervision:
+          L_goal_reg = sum_i r_i * smooth_l1(goal_xy_i, gt_endpoint)
+        """
+        if gt_endpoint is None or not torch.is_tensor(gt_endpoint):
+            return None
+        zero = gt_endpoint.new_zeros(())
+
+        if (
+            goal_xy is None
+            or responsibility is None
+            or (not torch.is_tensor(goal_xy))
+            or (not torch.is_tensor(responsibility))
+            or goal_xy.dim() != 3
+            or responsibility.dim() != 2
+            or goal_xy.size(0) != gt_endpoint.size(0)
+            or responsibility.size(0) != gt_endpoint.size(0)
+        ):
+            return zero
+
+        num_goals = min(goal_xy.size(1), responsibility.size(1))
+        if num_goals <= 0:
+            return zero
+        goal_xy = goal_xy[:, :num_goals, :2]
+        responsibility = responsibility[:, :num_goals]
+
+        if valid_mask is None:
+            valid_mask = torch.ones(
+                gt_endpoint.size(0), dtype=torch.bool, device=gt_endpoint.device
+            )
+        else:
+            valid_mask = valid_mask.bool()
+
+        finite_goal_xy = torch.isfinite(goal_xy).all(dim=-1).all(dim=-1)
+        finite_resp = torch.isfinite(responsibility).all(dim=-1)
+        finite_gt = torch.isfinite(gt_endpoint).all(dim=-1)
+        valid_mask = valid_mask & finite_goal_xy & finite_resp & finite_gt
+        if not valid_mask.any():
+            return zero
+
+        # smooth_l1 per coordinate -> sum x/y -> weighted sum over goals
+        endpoint_expanded = gt_endpoint.unsqueeze(1).expand(-1, num_goals, -1)
+        reg_per_coord = F.smooth_l1_loss(goal_xy, endpoint_expanded, reduction='none')
+        reg_per_goal = reg_per_coord.sum(dim=-1)  # [B, G]
+        reg_per_sample = (responsibility * reg_per_goal).sum(dim=-1)  # [B]
+        reg_loss = reg_per_sample[valid_mask].mean()
+        reg_loss = torch.nan_to_num(reg_loss, nan=0.0, posinf=0.0, neginf=0.0)
+        return reg_loss
+
     def cal_loss(self, out, data, tag=''):
         y_hat, pi, y_hat_others = out["y_hat"], out["pi"], out["y_hat_others"]
         scal, scal_new = out["scal"], out["scal_new"]
@@ -104,6 +348,8 @@ class Trainer(pl.LightningModule):
         new_pi = out.get("new_pi", None)
         dense_predict = out.get("dense_predict", None)
         ep_offsets = out.get("ep_offsets", None)
+        goal_scores = out.get("goal_scores", None)
+        goal_xy = out.get("goal_xy", None)
         
         center = data["x_centers"][:,0]
 
@@ -183,11 +429,48 @@ class Trainer(pl.LightningModule):
         predictions['probs'] = new_pi
         laplace_loss_new = self.laplace_loss.compute(predictions, y)
         
+        # -------- goal auxiliary supervision (minimal intrusive) --------
+        # Extract ego GT endpoint with mask-aware fallback:
+        # - preferred: last valid future point
+        # - fallback: last future timestep
+        target_mask = data.get("target_mask", None)
+        ego_target_mask = None
+        if target_mask is not None and torch.is_tensor(target_mask):
+            if target_mask.dim() >= 3:
+                ego_target_mask = target_mask[:, 0]
+            elif target_mask.dim() == 2:
+                # fallback for direct [B, T] mask format
+                ego_target_mask = target_mask
+        gt_endpoint, endpoint_valid = self.get_gt_endpoint(y, ego_target_mask)
+
+        if gt_endpoint is None:
+            # fallback guard: no valid GT endpoint tensor
+            goal_cls_loss = y.new_zeros(())
+            goal_reg_loss = y.new_zeros(())
+        else:
+            goal_cls_loss, responsibility, goal_valid_mask = self._compute_goal_cls_loss(
+                goal_xy=goal_xy,
+                goal_scores=goal_scores,
+                gt_endpoint=gt_endpoint,
+                valid_mask=endpoint_valid,
+                tau=self.goal_tau,
+            )
+            if goal_cls_loss is None:
+                goal_cls_loss = y.new_zeros(())
+            goal_reg_loss = self._compute_goal_reg_loss(
+                goal_xy=goal_xy,
+                gt_endpoint=gt_endpoint,
+                responsibility=responsibility,
+                valid_mask=goal_valid_mask if goal_valid_mask is not None else endpoint_valid,
+            )
+            if goal_reg_loss is None:
+                goal_reg_loss = y.new_zeros(())
 
                 
         loss = new_agent_reg_loss + new_pi_reg_loss + laplace_loss + laplace_loss_new
         loss = loss + agent_reg_loss + agent_cls_loss + others_reg_loss + dense_reg_loss
         loss = loss + ep_reg_loss
+        loss = loss + self.lambda_goal_cls * goal_cls_loss + self.lambda_goal_reg * goal_reg_loss
                 
 
 
@@ -198,6 +481,10 @@ class Trainer(pl.LightningModule):
             f"{tag}others_reg_loss": others_reg_loss.item(),
             f"{tag}laplace_loss": laplace_loss.item(),
             f"{tag}laplace_loss_new": laplace_loss_new.item(),
+            f"{tag}loss_goal_cls": goal_cls_loss.item(),
+            f"{tag}loss_goal_reg": goal_reg_loss.item(),
+            f"{tag}loss_goal_cls_w": (self.lambda_goal_cls * goal_cls_loss).item(),
+            f"{tag}loss_goal_reg_w": (self.lambda_goal_reg * goal_reg_loss).item(),
         }
         
         if new_y_hat is not None:
@@ -332,8 +619,22 @@ class Trainer(pl.LightningModule):
                 )
             self._log_fallback_stats(out, tag="val", batch_size=1)
 
-        except:
-            pass
+        except Exception as exc:
+            self.val_exception_count += 1
+            print(
+                f"[validation_step] batch_idx={batch_idx}, "
+                f"exception_count={self.val_exception_count}, "
+                f"type={type(exc).__name__}, message={exc}"
+            )
+            self.log(
+                "val/exception_count",
+                float(self.val_exception_count),
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                batch_size=1,
+                sync_dist=True,
+            )
 
         # print(self.count, self.count_closet)
 
@@ -343,10 +644,8 @@ class Trainer(pl.LightningModule):
         self.submission_handler = SubmissionAv2(
             save_dir=save_dir
         )
-    
-    def on_test_end(self) -> None:
-
-       latency = self.total_time / len(self.test_dataloader().dataset)
+        self.total_time = 0.0
+        self.test_step_count = 0
 
     def test_step(self, data, batch_idx) -> None:
         if isinstance(data, list):
@@ -362,6 +661,7 @@ class Trainer(pl.LightningModule):
         
         latency = end_time - start_time
         self.total_time += latency
+        self.test_step_count += 1
 
         self.cur_time += 1
 
@@ -373,6 +673,11 @@ class Trainer(pl.LightningModule):
         self.submission_handler.format_data(data, out["y_hat"], out["pi"])
 
     def on_test_end(self) -> None:
+        avg_latency = self.total_time / max(self.test_step_count, 1)
+        print(
+            f"[test] steps={self.test_step_count}, "
+            f"avg_latency={avg_latency:.6f}s"
+        )
         self.submission_handler.generate_submission_file()
 
     def configure_optimizers(self):
