@@ -17,7 +17,7 @@ def preprocess(args):
     data_root = Path(args.data_root)
 
     # for mode in ["train", "val", "test"]:
-    for mode in ["train", "val", "test"]:
+    for mode in ["train", "val"]:
         save_dir = Path("data/processed") / mode
         extractor = Av2Extractor(save_path=save_dir, mode=mode)
 

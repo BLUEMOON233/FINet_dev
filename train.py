@@ -41,7 +41,7 @@ def main(conf):
         max_epochs=conf.epochs,
         accelerator="gpu",
         devices=conf.gpus,
-        strategy="auto",
+        strategy="ddp_find_unused_parameters_true", #"ddp_find_unused_parameters_false", # , 
         callbacks=callbacks,
         limit_train_batches=conf.limit_train_batches,
         limit_val_batches=conf.limit_val_batches,
@@ -49,20 +49,16 @@ def main(conf):
     )
     
     model = instantiate(conf.model.target)
-    datamodule = instantiate(conf.datamodule.target, test=conf.test)
-
-    if conf.test:
-        trainer.test(model, datamodule, ckpt_path=conf.checkpoint)
-    else:
-        os.system('cp -a %s %s' % ('conf', output_dir))
-        os.system('cp -a %s %s' % ('src', output_dir))
-        with open(f'{output_dir}/model.txt', 'w') as f:
-            original_stdout = sys.stdout
-            sys.stdout = f
-            print(model)
-            sys.stdout = original_stdout
-        trainer.fit(model, datamodule, ckpt_path=conf.checkpoint)
-        trainer.validate(model, datamodule.val_dataloader())
+    os.system('cp -a %s %s' % ('conf', output_dir))
+    os.system('cp -a %s %s' % ('src', output_dir))
+    with open(f'{output_dir}/model.txt', 'w') as f:
+        original_stdout = sys.stdout  
+        sys.stdout = f  
+        print(model)  
+        sys.stdout = original_stdout  
+    datamodule = instantiate(conf.datamodule.target)
+    trainer.fit(model, datamodule, ckpt_path=conf.checkpoint)
+    trainer.validate(model, datamodule.val_dataloader())
 
 
 if __name__ == "__main__":

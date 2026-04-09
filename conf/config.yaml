@@ -6,7 +6,7 @@ hydra:
   run:
     dir: outputs/${output}/${now:%Y%m%d-%H%M%S}
 
-seed: 2024
+seed: 2026
 monitor: val_minFDE6
 save_top_k: 10
 
@@ -16,24 +16,25 @@ pretrained_weights:
 output: change_${datamodule.name}_${datamodule.phase}_${model.name}_${model.phase}
 
 # trainer
-num_workers: 16
-gpus: 1  # Paper: 10x RTX A5000; test/inference: 1 GPU
-sync_bn: false
-batch_size: 160
+num_workers: 4
+gpus: 1  # when test, only use 1 gpu; when train/val, use 8 gpus
+sync_bn: true
+batch_size: 256
 epochs: 60
 warmup_epochs: 10
-ws_offset: [0.0, 1.0]  # only RP2 supervised
+ws_offset: [1.0, 1.0]
 
 enc_layer_1: 4
 enc_layer_2: 2
 
-dec_layer_1: 2  # TEDec: 2+4=6 CAM blocks (supplementary)
+dec_layer_1: 4
 dec_layer_2: 4
+t_per_tok: 10
 
 # optimizer
-lr: 0.0015
-weight_decay: 1e-2  
-gradient_clip_val: 5
+lr: 0.003
+weight_decay: 1e-3
+gradient_clip_val: 1.0
 gradient_clip_algorithm: norm
 
 limit_train_batches:

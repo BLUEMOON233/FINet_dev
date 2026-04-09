@@ -4,8 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .layers.lane_embedding import LaneEmbeddingLayer
 from .layers.transformer_blocks import Block, InteractionBlock
-from .layers.time_decoder import TimeDecoder
-from .layers.structured_mode_generator import StructuredFutureModeGenerator
+from .layers.donut_decoder import DonutMambaDecoder
 from .layers.mamba.vim_mamba import init_weights, create_block
 from functools import partial
 from timm.models.layers import DropPath, to_2tuple
@@ -53,10 +52,7 @@ class ModelForecast(nn.Module):
         enc_layer_2: int = 2,
         dec_layer_1: int = 2,
         dec_layer_2: int = 4,
-        mode_top_ng: int = 3,
-        mode_num_social: int = 2,
-        mode_num_modes: int = 6,
-        mode_social_topk: int = 8,
+        t_per_tok: int = 10,
     ) -> None:
         super().__init__()
 
@@ -99,7 +95,17 @@ class ModelForecast(nn.Module):
             nn.Linear(embed_dim, 256), nn.GELU(), nn.Linear(256, future_steps * 2)
         )
 
-        self.time_decoder = TimeDecoder(dec_layer_1=dec_layer_1, dec_layer_2=dec_layer_2)
+        self.t_per_tok = t_per_tok
+        self.time_decoder = DonutMambaDecoder(
+            embed_dim=embed_dim,
+            t_per_tok=self.t_per_tok,
+            num_modes=6,
+            future_steps=future_steps,
+            dec_layer_1=dec_layer_1,
+            dec_layer_2=dec_layer_2,
+            num_heads=num_heads,
+            drop_path=drop_path,
+        )
         
         num_layers = 4
         encoder_depth = 4
@@ -142,14 +148,7 @@ class ModelForecast(nn.Module):
         self.decoder0 = MultimodalDecoder(embed_dim)
         
         self.future_steps = future_steps
-        self.mode_num_modes = mode_num_modes
-        self.mode_generator = StructuredFutureModeGenerator(
-            embed_dim=embed_dim,
-            top_ng=mode_top_ng,
-            num_social=mode_num_social,
-            num_modes=mode_num_modes,
-            social_topk=mode_social_topk,
-        )
+        self.tokens = nn.Parameter(torch.randn(1, 6, 128))   
 
         self.initialize_weights()
 
@@ -179,56 +178,24 @@ class ModelForecast(nn.Module):
         return self.load_state_dict(state_dict=state_dict, strict=False)
 
 
-    def spatial_mamba(
-        self,
-        x_encoder,
-        x_centers,
-        num_agents,
-        x_angles=None,
-        lane_angles=None,
-        lane_attr=None,
-        agent_valid_mask=None,
-        lane_valid_mask=None,
-    ):
+    def spatial_mamba(self, x_encoder, x_centers):
         ep_offset_1, ep_tok_1 = self.decoder0(x_encoder[:,0])
         # ep_offset_1 = ep_offset_1.detach()
 
-        # structured future mode generation
-        # agent_feat: [B, N, D], lane_feat: [B, M, D]
-        # fut_tok: [B, 6, D]
-        agent_feat = x_encoder[:, :num_agents]
-        lane_feat = x_encoder[:, num_agents:]
-        agent_centers = x_centers[:, :num_agents]
-        lane_centers = x_centers[:, num_agents:]
-        fut_tok, aux_mode = self.mode_generator(
-            focal_feat=agent_feat[:, 0],
-            agent_feat=agent_feat,
-            lane_feat=lane_feat,
-            x_centers=agent_centers,
-            lane_centers=lane_centers,
-            x_angles=x_angles,
-            lane_angles=lane_angles,
-            lane_attr=lane_attr,
-            agent_valid_mask=agent_valid_mask,
-            lane_valid_mask=lane_valid_mask,
-            goal_bias=ep_offset_1,  # decoder0 endpoint bias for goal proposal
-        )
-
-        if agent_valid_mask is not None and lane_valid_mask is not None:
-            valid_mask = torch.cat([agent_valid_mask, lane_valid_mask], dim=1)
-        else:
-            valid_mask = (x_centers.sum(-1) != 0)
+        valid_mask = (x_centers.sum(-1) != 0)
         valid_mask[:,0] = True
         
         center = x_centers[:,0] + ep_offset_1
         dists = ((x_centers - center.unsqueeze(1))**2).sum(-1)
-        dists[~valid_mask] = 40000  # invalid tokens sort first (before valid, before ego)
+        dists[~valid_mask] = 40000
         dists[:,0] = -1
         dists_sort, indexes = dists.sort(dim=1, descending=True)
+        
 
         x_encoder = torch.gather(x_encoder, 1, indexes.unsqueeze(-1).expand(-1, -1, x_encoder.size(2)))
         
-        # keep original endpoint token update path for first mode
+        fut_tok = x_encoder[:,-1:].clone()
+        fut_tok = fut_tok + self.tokens
         fut_tok = torch.cat([fut_tok[:,:1] + ep_tok_1.unsqueeze(1), fut_tok[:,1:]], 1)
 
         x_encoder = torch.cat([x_encoder, fut_tok], 1)
@@ -249,8 +216,8 @@ class ModelForecast(nn.Module):
             residual_in_fp32=True  
         ) # [421, 50, 128]
 
-        fut_tok = x_encoder[:, -self.mode_num_modes:]
-        x_encoder = x_encoder[:, :-self.mode_num_modes]
+        fut_tok = x_encoder[:, -6:]
+        x_encoder = x_encoder[:, :-6]
 
         x_encoder = torch.scatter(x_encoder, 1, indexes.unsqueeze(-1).expand(-1, -1, x_encoder.size(2)), x_encoder)
 
@@ -264,7 +231,7 @@ class ModelForecast(nn.Module):
 
         center = x_centers[:,0] + ep_offset_2
         dists = ((x_centers - center.unsqueeze(1))**2).sum(-1)
-        dists[~valid_mask] = 40000  # invalid tokens sort first (before valid, before ego)
+        dists[~valid_mask] = 40000
         dists[:,0] = -1
         dists_sort, indexes = dists.sort(dim=1, descending=True)
 
@@ -286,12 +253,12 @@ class ModelForecast(nn.Module):
             prenorm=False,
             residual_in_fp32=True  
         ) # [421, 50, 128]
-        fut_tok = x_encoder[:, -self.mode_num_modes:]
-        x_encoder = x_encoder[:, :-self.mode_num_modes]
+        fut_tok = x_encoder[:, -6:]
+        x_encoder = x_encoder[:, :-6]
         
         # #! query-base cross-attention
         x_encoder = torch.scatter(x_encoder, 1, indexes.unsqueeze(-1).expand(-1, -1, x_encoder.size(2)), x_encoder)
-        return x_encoder, fut_tok, [ep_offset_1, ep_offset_2], aux_mode
+        return x_encoder, fut_tok, [ep_offset_1, ep_offset_2]
         # return x_encoder, fut_tok, [ep_offset_2]
 
 
@@ -374,16 +341,7 @@ class ModelForecast(nn.Module):
         
         
 
-        x_encoder, mode, ep_offsets, aux_mode = self.spatial_mamba(
-            x_encoder,
-            x_centers,
-            num_agents=N,
-            x_angles=data["x_angles"][:, :, -1],
-            lane_angles=data["lane_angles"],
-            lane_attr=data.get("lane_attr", None),
-            agent_valid_mask=data.get("x_key_valid_mask", None),
-            lane_valid_mask=data.get("lane_key_valid_mask", None),
-        )
+        x_encoder, mode, ep_offsets = self.spatial_mamba(x_encoder, x_centers)
         x_encoder = self.norm(x_encoder) # [16, 173, 128]
 
 
@@ -391,12 +349,9 @@ class ModelForecast(nn.Module):
         y_hat_others = self.dense_predictor(x_others).view(B, x_others.size(1), -1, 2) # ([16, 47, 60, 2]
 
         
-        ep_embedding = torch.linspace(0, 1, steps=self.future_steps).view(1, 1, -1, 1).to(mode.device) * mode.unsqueeze(2)
-        mode = x_encoder[:,:1].unsqueeze(1) + ep_embedding
-
-        # decoder module with decoupled queries
+        ego_feat = x_encoder[:, 0]
         dense_predict, y_hat, pi, x_mode, new_y_hat, new_pi, scal, scal_new = \
-        self.time_decoder(mode, x_encoder, mask=~key_valid_mask)
+        self.time_decoder(mode, ego_feat, x_encoder, mask=~key_valid_mask)
 
         ret_dict = {
             "y_hat": y_hat,  # trajectory output from mode query
@@ -412,12 +367,6 @@ class ModelForecast(nn.Module):
             "new_y_hat": new_y_hat,  # final trajectory output
             "new_pi": new_pi,  # final probability output     
             "scal_new": scal_new,  # final output for Laplace loss
-
-            # auxiliary outputs for structured future modes
-            "goal_scores": aux_mode.get("goal_scores", None) if aux_mode is not None else None,
-            "goal_xy": aux_mode.get("goal_xy", None) if aux_mode is not None else None,
-            "social_logits": aux_mode.get("social_logits", None) if aux_mode is not None else None,
-            "fallback_stats": aux_mode.get("fallback_stats", None) if aux_mode is not None else None,
             
         }
 

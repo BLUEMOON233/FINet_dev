@@ -15,10 +15,7 @@ target:
     enc_layer_2: ${enc_layer_2}
     dec_layer_1: ${dec_layer_1}
     dec_layer_2: ${dec_layer_2}
-    mode_top_ng: 3
-    mode_num_social: 2
-    mode_num_modes: 6
-    mode_social_topk: 8
+    t_per_tok: ${t_per_tok}
   pretrained_weights: ${pretrained_weights}
   lr: ${lr}
   weight_decay: ${weight_decay}
