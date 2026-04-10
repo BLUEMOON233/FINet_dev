@@ -272,14 +272,15 @@ class ModelForecast(nn.Module):
         # agent encoding
         hist_valid_mask = data["x_valid_mask"] # [16, 48, 50]
         hist_key_valid_mask = data["x_key_valid_mask"] # [16, 48]
+        hist_valid_float = hist_valid_mask.to(data["x_angles"].dtype)
         hist_feat = torch.cat(
             [
                 data["x_positions_diff"],
                 data["x_velocity_diff"][..., None],
                 hist_valid_mask[..., None],
                 data["x_heading_diff"][..., None],
-                torch.cos(data["x_angles"])[..., None],
-                torch.sin(data["x_angles"])[..., None],
+                (torch.cos(data["x_angles"]) * hist_valid_float)[..., None],
+                (torch.sin(data["x_angles"]) * hist_valid_float)[..., None],
             ],
             dim=-1,
         ) # [16, 48, 50, 7]
