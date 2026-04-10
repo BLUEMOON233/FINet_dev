@@ -12,7 +12,7 @@ try:
     from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
 except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
-    
+
 from .models_mamba import RMSNorm, rms_norm_fn
 
 class MultimodalDecoder(nn.Module):
@@ -28,7 +28,7 @@ class MultimodalDecoder(nn.Module):
             nn.ReLU(),
             nn.Linear(256, embed_dim),
         )
-        
+
         self.loc = nn.Sequential(
             nn.ReLU(),
             nn.Linear(embed_dim, 2),
@@ -57,20 +57,20 @@ class ModelForecast(nn.Module):
         super().__init__()
 
         self.hist_embed_mlp = nn.Sequential(
-            nn.Linear(4, 64),
+            nn.Linear(7, 64),
             nn.GELU(),
             nn.Linear(64, embed_dim),
         )
 
         # Agent Encoding Mamba
-        self.hist_embed_mamba = nn.ModuleList(  
+        self.hist_embed_mamba = nn.ModuleList(
             [
-                create_block(  
+                create_block(
                     d_model=embed_dim,
                     layer_idx=i,
-                    drop_path=0.2,  
-                    bimamba=False,  
-                    rms_norm=True,  
+                    drop_path=0.2,
+                    bimamba=False,
+                    rms_norm=True,
                 )
                 for i in range(4)
             ]
@@ -106,49 +106,44 @@ class ModelForecast(nn.Module):
             num_heads=num_heads,
             drop_path=drop_path,
         )
-        
-        num_layers = 4
-        encoder_depth = 4
-        bimamba_type="none"
-        norm_layer = nn.LayerNorm
+
+        # Round 1: spatial Mamba
         self.samba_blocks1 = nn.ModuleList(
             [
-                create_block(  
+                create_block(
                     d_model=embed_dim,
                     layer_idx=i,
-                    drop_path=0.2,  
-                    bimamba=True,  
-                    rms_norm=True,  
+                    drop_path=0.2,
+                    bimamba=True,
+                    rms_norm=True,
                 )
                 for i in range(enc_layer_1)
             ]
         )
         self.norm_f_1 = RMSNorm(embed_dim, eps=1e-5)
         self.drop_path_1 = DropPath(drop_path)
-        self.decoder1 = MultimodalDecoder(embed_dim)
 
-        # dpr = [x.item() for x in torch.linspace(0, drop_path, sum(encoder_depth))]
+        # Round 2: spatial Mamba (sorted by Proposer endpoint)
         self.samba_blocks2 = nn.ModuleList(
             [
-                create_block(  
+                create_block(
                     d_model=embed_dim,
                     layer_idx=i,
-                    drop_path=0.2,  
-                    bimamba=True,  
-                    rms_norm=True,  
+                    drop_path=0.2,
+                    bimamba=True,
+                    rms_norm=True,
                 )
-                for i in range(enc_layer_2) #encoder_depth)
+                for i in range(enc_layer_2)
             ]
         )
         self.norm_f_2 = RMSNorm(embed_dim, eps=1e-5)
         self.drop_path_2 = DropPath(drop_path)
-        # self.fut_tok = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        # self.fut_mlp = nn.Linear(embed_dim, embed_dim)
-        
+
+        # Endpoint predictor for Round 1 sorting
         self.decoder0 = MultimodalDecoder(embed_dim)
-        
+
         self.future_steps = future_steps
-        self.tokens = nn.Parameter(torch.randn(1, 6, 128))   
+        self.tokens = nn.Parameter(torch.randn(1, 6, 128))
 
         self.initialize_weights()
 
@@ -166,9 +161,6 @@ class ModelForecast(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
-            
-        # nn.init.constant_(self.fut_mlp.weight, 1)  # Set all weights to 1
-        # nn.init.constant_(self.fut_mlp.bias, 0)    # Set all biases to 0
 
     def load_from_checkpoint(self, ckpt_path):
         ckpt = torch.load(ckpt_path, map_location="cpu")["state_dict"]
@@ -177,96 +169,106 @@ class ModelForecast(nn.Module):
         }
         return self.load_state_dict(state_dict=state_dict, strict=False)
 
+    # ------------------------------------------------------------------ #
+    #  Two-round spatial Mamba (split for Proposer insertion between rounds)
+    # ------------------------------------------------------------------ #
 
-    def spatial_mamba(self, x_encoder, x_centers):
-        ep_offset_1, ep_tok_1 = self.decoder0(x_encoder[:,0])
-        # ep_offset_1 = ep_offset_1.detach()
+    def spatial_mamba_round1(self, x_encoder, x_centers):
+        """Round 1: decoder0 endpoint → sort → biMamba(samba_blocks1)."""
+        ep_offset_1, ep_tok_1 = self.decoder0(x_encoder[:, 0])
 
         valid_mask = (x_centers.sum(-1) != 0)
-        valid_mask[:,0] = True
-        
-        center = x_centers[:,0] + ep_offset_1
-        dists = ((x_centers - center.unsqueeze(1))**2).sum(-1)
-        dists[~valid_mask] = 40000
-        dists[:,0] = -1
-        dists_sort, indexes = dists.sort(dim=1, descending=True)
-        
+        valid_mask[:, 0] = True
 
-        x_encoder = torch.gather(x_encoder, 1, indexes.unsqueeze(-1).expand(-1, -1, x_encoder.size(2)))
-        
-        fut_tok = x_encoder[:,-1:].clone()
+        center = x_centers[:, 0] + ep_offset_1
+        dists = ((x_centers - center.unsqueeze(1)) ** 2).sum(-1)
+        dists[~valid_mask] = 40000
+        dists[:, 0] = -1
+        _, indexes = dists.sort(dim=1, descending=True)
+
+        x_encoder = torch.gather(
+            x_encoder, 1,
+            indexes.unsqueeze(-1).expand(-1, -1, x_encoder.size(2)),
+        )
+
+        fut_tok = x_encoder[:, -1:].clone()
         fut_tok = fut_tok + self.tokens
-        fut_tok = torch.cat([fut_tok[:,:1] + ep_tok_1.unsqueeze(1), fut_tok[:,1:]], 1)
+        fut_tok = torch.cat(
+            [fut_tok[:, :1] + ep_tok_1.unsqueeze(1), fut_tok[:, 1:]], 1
+        )
 
         x_encoder = torch.cat([x_encoder, fut_tok], 1)
 
-        # apply Samba blocks ----------------
-        #! First round: init sort & predict ego endpoint
+        # biMamba Round 1
         residual = None
         for blk in self.samba_blocks1:
-            x_encoder, residual = blk(x_encoder, residual)                                      # [bs, N+M, D]
-        fused_add_norm_fn = rms_norm_fn if isinstance(self.norm_f_1, RMSNorm) else layer_norm_fn
+            x_encoder, residual = blk(x_encoder, residual)
+        fused_add_norm_fn = rms_norm_fn
         x_encoder = fused_add_norm_fn(
             self.drop_path_1(x_encoder),
-            self.norm_f_1.weight,
-            self.norm_f_1.bias,
-            eps=self.norm_f_1.eps,
-            residual=residual,
-            prenorm=False,
-            residual_in_fp32=True  
-        ) # [421, 50, 128]
+            self.norm_f_1.weight, self.norm_f_1.bias,
+            eps=self.norm_f_1.eps, residual=residual,
+            prenorm=False, residual_in_fp32=True,
+        )
 
         fut_tok = x_encoder[:, -6:]
         x_encoder = x_encoder[:, :-6]
 
-        x_encoder = torch.scatter(x_encoder, 1, indexes.unsqueeze(-1).expand(-1, -1, x_encoder.size(2)), x_encoder)
+        # Restore original order
+        x_encoder = torch.scatter(
+            x_encoder, 1,
+            indexes.unsqueeze(-1).expand(-1, -1, x_encoder.size(2)),
+            x_encoder,
+        )
 
-        x_ego = fut_tok[:,0]
-        ep_offset_2, ep_tok_2 = self.decoder1(x_ego)
-        # ep_offset_2 = ep_offset_2.detach()
+        return x_encoder, fut_tok, ep_offset_1, valid_mask
 
-        
-        # center_init = y_hat_init[..., -1, :]
-        fut_tok = torch.cat([fut_tok[:,:1] + ep_tok_2.unsqueeze(1), fut_tok[:,1:]], 1)
-
-        center = x_centers[:,0] + ep_offset_2
-        dists = ((x_centers - center.unsqueeze(1))**2).sum(-1)
+    def spatial_mamba_round2(self, x_encoder_r1, fut_tok_r1,
+                             proposer_endpoint, x_centers, valid_mask):
+        """Round 2: Proposer endpoint → resort → biMamba(samba_blocks2)."""
+        center = x_centers[:, 0] + proposer_endpoint  # already detached
+        dists = ((x_centers - center.unsqueeze(1)) ** 2).sum(-1)
         dists[~valid_mask] = 40000
-        dists[:,0] = -1
-        dists_sort, indexes = dists.sort(dim=1, descending=True)
+        dists[:, 0] = -1
+        _, indexes = dists.sort(dim=1, descending=True)
 
-        x_encoder = torch.gather(x_encoder, 1, indexes.unsqueeze(-1).expand(-1, -1, x_encoder.size(2)))
-        x_encoder = torch.cat([x_encoder, fut_tok], 1)
-        #! Second round: resort & predict ego endpoint
-        # for blk in self.samba_blocks2:
-        #     x_encoder = blk(x_encoder)                                      # [bs, N+M, D]
+        x_encoder = torch.gather(
+            x_encoder_r1, 1,
+            indexes.unsqueeze(-1).expand(-1, -1, x_encoder_r1.size(2)),
+        )
+        x_encoder = torch.cat([x_encoder, fut_tok_r1], 1)
+
+        # biMamba Round 2
         residual = None
         for blk in self.samba_blocks2:
-            x_encoder, residual = blk(x_encoder, residual)   
-        fused_add_norm_fn = rms_norm_fn if isinstance(self.norm_f_2, RMSNorm) else layer_norm_fn
+            x_encoder, residual = blk(x_encoder, residual)
+        fused_add_norm_fn = rms_norm_fn
         x_encoder = fused_add_norm_fn(
             self.drop_path_2(x_encoder),
-            self.norm_f_2.weight,
-            self.norm_f_2.bias,
-            eps=self.norm_f_2.eps,
-            residual=residual,
-            prenorm=False,
-            residual_in_fp32=True  
-        ) # [421, 50, 128]
+            self.norm_f_2.weight, self.norm_f_2.bias,
+            eps=self.norm_f_2.eps, residual=residual,
+            prenorm=False, residual_in_fp32=True,
+        )
+
         fut_tok = x_encoder[:, -6:]
         x_encoder = x_encoder[:, :-6]
-        
-        # #! query-base cross-attention
-        x_encoder = torch.scatter(x_encoder, 1, indexes.unsqueeze(-1).expand(-1, -1, x_encoder.size(2)), x_encoder)
-        return x_encoder, fut_tok, [ep_offset_1, ep_offset_2]
-        # return x_encoder, fut_tok, [ep_offset_2]
 
+        # Restore original order
+        x_encoder = torch.scatter(
+            x_encoder, 1,
+            indexes.unsqueeze(-1).expand(-1, -1, x_encoder.size(2)),
+            x_encoder,
+        )
 
+        return x_encoder, fut_tok
+
+    # ------------------------------------------------------------------ #
+    #  Forward: Round1 → Proposer → Round2 → Refiner
+    # ------------------------------------------------------------------ #
 
     def forward(self, data):
-        
 
-        ###### Scene context encoding ###### 
+        ###### Scene context encoding ######
         # agent encoding
         hist_valid_mask = data["x_valid_mask"] # [16, 48, 50]
         hist_key_valid_mask = data["x_key_valid_mask"] # [16, 48]
@@ -275,100 +277,149 @@ class ModelForecast(nn.Module):
                 data["x_positions_diff"],
                 data["x_velocity_diff"][..., None],
                 hist_valid_mask[..., None],
+                data["x_heading_diff"][..., None],
+                torch.cos(data["x_angles"])[..., None],
+                torch.sin(data["x_angles"])[..., None],
             ],
             dim=-1,
-        ) # [16, 48, 50, 4] different to forecast-mae
+        ) # [16, 48, 50, 7]
 
         B, N, L, D = hist_feat.shape
-        hist_feat = hist_feat.view(B * N, L, D) # [768, 50, 4]
-        hist_feat_key_valid = hist_key_valid_mask.view(B * N) # [768]
-        
-
+        hist_feat = hist_feat.view(B * N, L, D)
+        hist_feat_key_valid = hist_key_valid_mask.view(B * N)
 
         # unidirectional mamba
-        actor_feat = self.hist_embed_mlp(hist_feat[hist_feat_key_valid].contiguous()) # [421, 50, 128]
+        actor_feat = self.hist_embed_mlp(hist_feat[hist_feat_key_valid].contiguous())
         residual = None
         for blk_mamba in self.hist_embed_mamba:
-            actor_feat, residual = blk_mamba(actor_feat, residual) # [421, 50, 128], [421, 50, 128]
+            actor_feat, residual = blk_mamba(actor_feat, residual)
         fused_add_norm_fn = rms_norm_fn if isinstance(self.norm_f, RMSNorm) else layer_norm_fn
         actor_feat = fused_add_norm_fn(
             self.drop_path(actor_feat),
-            self.norm_f.weight,
-            self.norm_f.bias,
-            eps=self.norm_f.eps,
-            residual=residual,
-            prenorm=False,
-            residual_in_fp32=True  
-        ) # [421, 50, 128]
+            self.norm_f.weight, self.norm_f.bias,
+            eps=self.norm_f.eps, residual=residual,
+            prenorm=False, residual_in_fp32=True,
+        )
 
-        actor_feat = actor_feat[:, -1] # [421, 128]
-        # actor_feat = actor_feat[:, 0] # [421, 128]
+        actor_feat = actor_feat[:, -1]
         actor_feat_tmp = torch.zeros(
             B * N, actor_feat.shape[-1], device=actor_feat.device
-        ) # [768, 128]
-        actor_feat_tmp[hist_feat_key_valid] = actor_feat # [768, 128]
-        actor_feat = actor_feat_tmp.view(B, N, actor_feat.shape[-1]) # [16, 48, 128]
+        )
+        actor_feat_tmp[hist_feat_key_valid] = actor_feat
+        actor_feat = actor_feat_tmp.view(B, N, actor_feat.shape[-1])
 
         # map encoding
-        lane_valid_mask = data["lane_valid_mask"] # [16, 125, 20]
-        lane_normalized = data["lane_positions"] - data["lane_centers"].unsqueeze(-2) # [16, 125, 20, 2]
+        lane_valid_mask = data["lane_valid_mask"]
+        lane_normalized = data["lane_positions"] - data["lane_centers"].unsqueeze(-2)
         lane_normalized = torch.cat(
             [lane_normalized, lane_valid_mask[..., None]], dim=-1
-        ) # [16, 125, 20, 3]
+        )
         B, M, L, D = lane_normalized.shape
-        lane_feat = self.lane_embed(lane_normalized.view(-1, L, D).contiguous()) # [2000, 128]
-        lane_feat = lane_feat.view(B, M, -1) # [16, 125, 128]
+        lane_feat = self.lane_embed(lane_normalized.view(-1, L, D).contiguous())
+        lane_feat = lane_feat.view(B, M, -1)
 
         # type embedding and position embedding
         x_centers = torch.cat([data["x_centers"], data["lane_centers"]], dim=1)
         angles = torch.cat([data["x_angles"][:, :, -1], data["lane_angles"]], dim=1)
         x_angles = torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)
         pos_feat = torch.cat([x_centers, x_angles], dim=-1)
-        pos_embed = self.pos_embed(pos_feat) # [16, 173, 128]
+        pos_embed = self.pos_embed(pos_feat)
 
-        actor_type_embed = self.actor_type_embed[data["x_attr"][..., 2].long()] # [16, 48, 128]
-        lane_type_embed = self.lane_type_embed[data["lane_attr"][..., 0].long()] # [16, 125, 128]
+        actor_type_embed = self.actor_type_embed[data["x_attr"][..., 2].long()]
+        lane_type_embed = self.lane_type_embed[data["lane_attr"][..., 0].long()]
         actor_feat += actor_type_embed
         lane_feat += lane_type_embed
 
         # scene context features
-        x_encoder = torch.cat([actor_feat, lane_feat], dim=1) # [16, 173, 128]
+        x_encoder = torch.cat([actor_feat, lane_feat], dim=1)  # [B, 173, 128]
         key_valid_mask = torch.cat(
             [data["x_key_valid_mask"], data["lane_key_valid_mask"]], dim=1
-        ) # [16, 173]
+        )
 
-        x_encoder = x_encoder + pos_embed # [16, 173, 128]
-        
-        
+        x_encoder = x_encoder + pos_embed
 
-        x_encoder, mode, ep_offsets = self.spatial_mamba(x_encoder, x_centers)
-        x_encoder = self.norm(x_encoder) # [16, 173, 128]
+        ###### Round 1: spatial Mamba (sorted by decoder0 endpoint) ######
+        x_encoder_r1, mode_r1, ep_offset_1, valid_mask = \
+            self.spatial_mamba_round1(x_encoder, x_centers)
+        x_encoder_r1 = self.norm(x_encoder_r1)
 
+        ###### Proposer (uses Round 1 scene encoding) ######
+        ego_feat_r1 = x_encoder_r1[:, 0]
+        init_heading = data["x_angles"][:, 0, -1]
 
-        x_others = x_encoder[:, 1:N] # [16, 47, 128]
-        y_hat_others = self.dense_predictor(x_others).view(B, x_others.size(1), -1, 2) # ([16, 47, 60, 2]
+        (y_hat, pi, scal, proposer_feats, heading_hat, conc_hat,
+         y_hat_over, scal_over, heading_over, conc_over) = \
+            self.time_decoder.proposer(
+                mode_tokens=mode_r1,
+                ego_feat=ego_feat_r1,
+                scene_encoding=x_encoder_r1,
+                scene_mask=~key_valid_mask,
+                init_heading=init_heading,
+            )
 
-        
-        ego_feat = x_encoder[:, 0]
-        dense_predict, y_hat, pi, x_mode, new_y_hat, new_pi, scal, scal_new = \
-        self.time_decoder(mode, ego_feat, x_encoder, mask=~key_valid_mask)
+        ###### Pi-weighted endpoint for Round 2 sorting (detached) ######
+        pi_weights = F.softmax(pi, dim=1).unsqueeze(-1)       # [B, 6, 1]
+        proposer_endpoint = (
+            pi_weights * y_hat[:, :, -1, :]
+        ).sum(dim=1).detach()                                  # [B, 2]
+
+        ###### Round 2: spatial Mamba (sorted by Proposer endpoint) ######
+        x_encoder_r2, mode_r2 = self.spatial_mamba_round2(
+            x_encoder_r1, mode_r1, proposer_endpoint, x_centers, valid_mask,
+        )
+        x_encoder_r2 = self.norm(x_encoder_r2)
+
+        ###### Other agents (uses Round 2 encoding) ######
+        x_others = x_encoder_r2[:, 1:N]
+        y_hat_others = self.dense_predictor(x_others).view(
+            B, x_others.size(1), -1, 2
+        )
+
+        ###### Refiner (uses Round 2 scene encoding) ######
+        ego_feat_r2 = x_encoder_r2[:, 0]
+
+        (new_y_hat, new_pi, scal_new, _, new_heading_hat, new_conc_hat,
+         new_y_hat_over, new_scal_over, new_heading_over, new_conc_over) = \
+            self.time_decoder.refiner(
+                mode_tokens=mode_r2,
+                ego_feat=ego_feat_r2,
+                scene_encoding=x_encoder_r2,
+                scene_mask=~key_valid_mask,
+                proposed_positions=y_hat.detach(),
+                proposed_headings=heading_hat.detach(),
+                proposer_feats=proposer_feats,
+                init_heading=init_heading,
+            )
 
         ret_dict = {
-            "y_hat": y_hat,  # trajectory output from mode query
-            "pi": pi,  # probability output from mode query
-            "scal": scal,  # output for Laplace loss from mode query
+            "y_hat": y_hat,
+            "pi": pi,
+            "scal": scal,
 
-            "dense_predict": dense_predict,  # trajectory output from state query
-            
-            "ep_offsets": ep_offsets,
+            "dense_predict": None,
 
-            "y_hat_others": y_hat_others,  # trajectory of other agents
+            "ep_offsets": [ep_offset_1],
 
-            "new_y_hat": new_y_hat,  # final trajectory output
-            "new_pi": new_pi,  # final probability output     
-            "scal_new": scal_new,  # final output for Laplace loss
-            
+            "y_hat_others": y_hat_others,
+
+            "new_y_hat": new_y_hat,
+            "new_pi": new_pi,
+            "scal_new": scal_new,
+
+            "heading_hat": heading_hat,
+            "conc_hat": conc_hat,
+            "new_heading_hat": new_heading_hat,
+            "new_conc_hat": new_conc_hat,
+
+            # Over-prediction
+            "y_hat_over": y_hat_over,
+            "scal_over": scal_over,
+            "heading_over": heading_over,
+            "conc_over": conc_over,
+            "new_y_hat_over": new_y_hat_over,
+            "new_scal_over": new_scal_over,
+            "new_heading_over": new_heading_over,
+            "new_conc_over": new_conc_over,
         }
-
 
         return ret_dict

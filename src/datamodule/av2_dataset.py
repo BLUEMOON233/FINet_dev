@@ -150,6 +150,7 @@ class Av2Dataset(Dataset):
         valid_mask = valid_mask[ag_mask] # [12, 90]
 
         # post_process
+        head_future = head[:, self.num_historical_steps:].clone()  # [N, 60]
         head = head[:, :self.num_historical_steps] # [12, 30]
         vel_future = vel[:, self.num_historical_steps:] # [12, 60]
         vel = vel[:, :self.num_historical_steps] # [12, 30]
@@ -161,10 +162,13 @@ class Av2Dataset(Dataset):
             valid_mask = valid_mask[:, :self.num_historical_steps] # [12, 30]
             target = torch.where(
                 target_mask.unsqueeze(-1),
-                target - pos_ctr.unsqueeze(1), torch.zeros(pos_ctr.size(0), 60, 2),   
+                target - pos_ctr.unsqueeze(1), torch.zeros(pos_ctr.size(0), 60, 2),
             ) # [12, 60, 2]
+            target_heading = torch.where(
+                target_mask, head_future, torch.zeros_like(head_future)
+            ) # [N, 60]
         else:
-            target = target_mask = None
+            target = target_mask = target_heading = None
 
         diff_mask = valid_mask[:, :self.num_historical_steps - 1] & valid_mask[:, 1: self.num_historical_steps] # [12, 29]
         tmp_pos = pos.clone() # [12, 30, 2]
@@ -196,7 +200,16 @@ class Av2Dataset(Dataset):
             vel_diff, torch.zeros(vel.size(0), self.num_historical_steps - 1)
         ) # [12, 30]
         vel[:, 0] = torch.zeros(vel.size(0)) # [12, 30]
-        
+
+        # heading diff (analogous to pos_diff and vel_diff)
+        head_diff = head[:, 1:self.num_historical_steps] - head[:, :self.num_historical_steps - 1]
+        head_diff = ((head_diff + np.pi) % (2 * np.pi)) - np.pi  # wrap to [-pi, pi]
+        head_diff = torch.where(
+            diff_mask,
+            head_diff, torch.zeros(head.size(0), self.num_historical_steps - 1)
+        )
+        x_heading_diff = torch.cat([torch.zeros(head.size(0), 1), head_diff], dim=1)  # [N, 50]
+
         # add target velocity and acceleration
         if target is not None:
             tmpvel_future = vel_future.clone() # [12, 60]
@@ -212,12 +225,14 @@ class Av2Dataset(Dataset):
             'target_diff': target_diff,
             'target_vel_diff': vel_future,
             'target_mask': target_mask,
+            'target_heading': target_heading,
 
             'x_positions_diff': pos,
             'x_positions': tmp_pos,
             'x_attr': attr,
             'x_centers': pos_ctr,
             'x_angles': head,
+            'x_heading_diff': x_heading_diff,
             'x_velocity': tmp_vel,
             'x_velocity_diff': vel,
             'x_valid_mask': valid_mask,
@@ -250,6 +265,7 @@ def collate_fn(seq_batch):
             'x_positions',
             'x_centers',
             'x_angles',
+            'x_heading_diff',
             'x_velocity',
             'x_velocity_diff',
             'lane_positions',
@@ -269,6 +285,7 @@ def collate_fn(seq_batch):
             data['target'] = pad_sequence([b['target'] for b in batch], batch_first=True)
             data['target_diff'] = pad_sequence([b['target_diff'] for b in batch], batch_first=True)
             data['target_vel_diff'] = pad_sequence([b['target_vel_diff'] for b in batch], batch_first=True)
+            data['target_heading'] = pad_sequence([b['target_heading'] for b in batch], batch_first=True)
             data['target_mask'] = pad_sequence(
                 [b['target_mask'] for b in batch], batch_first=True, padding_value=False
             )

@@ -1,5 +1,6 @@
 import datetime
 from pathlib import Path
+import math
 import time
 import pickle
 import pytorch_lightning as pl
@@ -12,6 +13,7 @@ from src.metrics import MR, minADE, minFDE, brier_minFDE
 from src.utils.optim import WarmupCosLR
 from src.utils.submission_av2 import SubmissionAv2
 from src.utils.LaplaceNLLLoss import LaplaceNLLLoss
+from src.utils.VonMisesNLLLoss import VonMisesNLLLoss
 from .model_forecast import ModelForecast
 
 import os
@@ -63,6 +65,7 @@ class Trainer(pl.LightningModule):
             }
         )
         self.loss_fn_pos = LaplaceNLLLoss(reduction='none')
+        self.loss_fn_head = VonMisesNLLLoss(reduction='none')
         self.val_metrics = metrics.clone(prefix="val_")
         self.val_metrics_new = metrics.clone(prefix="val_new_")
 
@@ -146,6 +149,15 @@ class Trainer(pl.LightningModule):
             step_ade = err_per_step[:, start:end].mean()
             self.log(f"{tag}/step_{s}_ade", step_ade, on_step=False, on_epoch=True, batch_size=B)
 
+        # --- 5. Heading error ---
+        if "heading_hat" in out and "target_heading" in data:
+            from .layers.coordinate_transforms import wrap_angle
+            gt_head = data["target_heading"][:, 0]  # [B, 60]
+            pred_head = out["new_heading_hat"][torch.arange(B), best_modes]  # [B, 60]
+            head_err = wrap_angle(pred_head - gt_head).abs()
+            self.log(f"{tag}/heading_mae_deg", head_err.mean() * 180 / math.pi,
+                     on_step=False, on_epoch=True, batch_size=B)
+
     @torch.no_grad()
     def _log_gradient_norms(self):
         """Log gradient norms for encoder vs decoder to check training balance."""
@@ -185,7 +197,15 @@ class Trainer(pl.LightningModule):
 
         return loss.mean()
 
-    def compute_cls_nll(self, pred_pos, scale_pos, gt_pos):
+    def compute_heading_reg_loss(self, best_pred_head, best_conc_head, gt_head):
+        """Von Mises NLL on heading for the best mode."""
+        pred = torch.stack([best_pred_head, best_conc_head], dim=-1)  # [B, 60, 2]
+        target = gt_head.unsqueeze(-1)  # [B, 60, 1]
+        loss = self.loss_fn_head(pred, target)  # [B, 60, 1]
+        return loss.mean()
+
+    def compute_cls_nll(self, pred_pos, scale_pos, gt_pos,
+                        pred_head=None, conc_head=None, gt_head=None):
         """NLL for ALL modes at last timestep (no gradient, for mixture cls loss)."""
         with torch.no_grad():
             # x at last timestep
@@ -195,6 +215,15 @@ class Trainer(pl.LightningModule):
             # y at last timestep
             last_y = torch.cat([pred_pos[:, :, -1:, 1:], scale_pos[:, :, -1:, 1:]], dim=-1)
             nll = nll + self.loss_fn_pos(last_y, gt_pos[:, None, -1:, 1:])
+
+            # heading at last timestep (if provided)
+            if pred_head is not None and conc_head is not None and gt_head is not None:
+                last_head = torch.stack([
+                    pred_head[:, :, -1:], conc_head[:, :, -1:]
+                ], dim=-1)  # [B, 6, 1, 2]
+                nll_head = self.loss_fn_head(last_head, gt_head[:, None, -1:, None])
+                nll = nll + nll_head
+
         return nll[:, :, 0, 0].detach()  # [B, 6]
 
     def cal_loss(self, out, data, tag=''):
@@ -203,9 +232,14 @@ class Trainer(pl.LightningModule):
         scal, scal_new = out["scal"], out["scal_new"]
         y_hat_others = out["y_hat_others"]
         ep_offsets = out.get("ep_offsets", None)
+        heading_hat = out["heading_hat"]            # [B, 6, 60]
+        conc_hat = out["conc_hat"]                  # [B, 6, 60]
+        new_heading_hat = out["new_heading_hat"]    # [B, 6, 60]
+        new_conc_hat = out["new_conc_hat"]          # [B, 6, 60]
 
         y, y_others = data["target"][:, 0], data["target"][:, 1:]
         center = data["x_centers"][:, 0]
+        gt_heading = data["target_heading"][:, 0]   # [B, 60]
         B = y.shape[0]
         index0 = torch.arange(B, device=y.device)
 
@@ -221,8 +255,43 @@ class Trainer(pl.LightningModule):
         reg_loss_ref = self.compute_reg_loss(
             new_y_hat[index0, best_mode], scal_new[index0, best_mode], y)
 
+        # --- Heading regression loss: proposer (Von Mises NLL) ---
+        heading_reg_prop = self.compute_heading_reg_loss(
+            heading_hat[index0, best_mode], conc_hat[index0, best_mode], gt_heading)
+
+        # --- Heading regression loss: refiner ---
+        heading_reg_ref = self.compute_heading_reg_loss(
+            new_heading_hat[index0, best_mode], new_conc_hat[index0, best_mode], gt_heading)
+
+        # --- Over-prediction loss (shifted GT, proposer + refiner) ---
+        over_loss = torch.tensor(0.0, device=y.device)
+        t_per_tok = self.net.t_per_tok if hasattr(self.net, 't_per_tok') else 10
+        shift = t_per_tok  # =10
+        t_pred = y.shape[1]  # =60
+        over_len = t_pred - shift  # =50
+
+        for over_key_prefix, stage_name in [("", "prop"), ("new_", "ref")]:
+            y_over = out.get(f"{over_key_prefix}y_hat_over")
+            s_over = out.get(f"{over_key_prefix}scal_over")
+            h_over = out.get(f"{over_key_prefix}heading_over")
+            c_over = out.get(f"{over_key_prefix}conc_over")
+            if y_over is not None and y_over.shape[2] >= over_len:
+                # Position over-prediction loss
+                over_loss = over_loss + self.compute_reg_loss(
+                    y_over[index0, best_mode, :over_len],
+                    s_over[index0, best_mode, :over_len],
+                    y[:, shift:])
+                # Heading over-prediction loss
+                if h_over is not None and h_over.shape[2] >= over_len:
+                    over_loss = over_loss + self.compute_heading_reg_loss(
+                        h_over[index0, best_mode, :over_len],
+                        c_over[index0, best_mode, :over_len],
+                        gt_heading[:, shift:])
+
         # --- Classification loss: mixture NLL (refiner only, DONUT style) ---
-        nll_all = self.compute_cls_nll(new_y_hat, scal_new, y)  # [B, 6]
+        nll_all = self.compute_cls_nll(
+            new_y_hat, scal_new, y,
+            new_heading_hat, new_conc_hat, gt_heading)
         log_pi = F.log_softmax(new_pi, dim=-1)
         cls_loss = -torch.logsumexp(log_pi - nll_all, dim=-1).mean()
 
@@ -244,7 +313,10 @@ class Trainer(pl.LightningModule):
             y_hat_others[others_reg_mask], y_others[others_reg_mask])
 
         # --- Total ---
-        loss = reg_loss_prop + reg_loss_ref + cls_loss + others_reg_loss
+        loss = (reg_loss_prop + reg_loss_ref + cls_loss
+                + heading_reg_prop + heading_reg_ref
+                + over_loss
+                + others_reg_loss)
         if torch.is_tensor(ep_reg_loss):
             loss = loss + ep_reg_loss
 
@@ -253,6 +325,9 @@ class Trainer(pl.LightningModule):
             f"{tag}reg_loss_prop": reg_loss_prop.item(),
             f"{tag}reg_loss_ref": reg_loss_ref.item(),
             f"{tag}cls_loss": cls_loss.item(),
+            f"{tag}heading_reg_prop": heading_reg_prop.item(),
+            f"{tag}heading_reg_ref": heading_reg_ref.item(),
+            f"{tag}over_loss": over_loss.item(),
             f"{tag}others_reg_loss": others_reg_loss.item(),
         }
         if ep_offsets is not None and torch.is_tensor(ep_reg_loss):
