@@ -27,14 +27,14 @@ ws_offset: [1.0, 1.0]
 enc_layer_1: 4
 enc_layer_2: 2
 
-dec_layer_1: 4
-dec_layer_2: 4
+dec_layer_1: 2
+dec_layer_2: 2
 t_per_tok: 10
 
 # optimizer
-lr: 0.003
-weight_decay: 1e-3
-gradient_clip_val: 1.0
+lr: 0.002
+weight_decay: 1e-2
+gradient_clip_val: 5.0
 gradient_clip_algorithm: norm
 
 limit_train_batches:

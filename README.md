@@ -1,21 +1,30 @@
-# FINet + DONUT Decoder: Mamba-based Autoregressive Trajectory Prediction
+# FINet + DONUT: Mamba-based Autoregressive Trajectory Prediction
 
 ## Overview
 
-This project is a modified version of **FINet** (Future-Aware Interaction Network), where the original parallel `TimeDecoder` has been replaced with a **DONUT-style autoregressive decoder** that uses **unidirectional Mamba** as the temporal core.
+This project combines **FINet**'s efficient Mamba encoder with **DONUT**'s structured autoregressive decoder for multi-modal trajectory prediction on Argoverse 2.
 
 ### Base Projects
 
 - **FINet** (ICCV 2025): Mamba-based trajectory prediction with future-aware spatial interaction.
 - **DONUT** (ICCV 2025): Decoder-only autoregressive trajectory prediction with tokenization and 4-type attention (Temporal/Road/Social/Mode).
 
-### Motivation
+### Core Idea
 
-FINet's original decoder generates all 60 future timesteps in parallel (Cross-Attention + bidirectional Mamba). DONUT demonstrates that autoregressive token-level prediction with explicit interaction types achieves strong results. This project combines the strengths of both: FINet's efficient Mamba encoder with DONUT's structured autoregressive decoder.
+FINet's original architecture uses a two-round BiMamba encoder for spatial interaction, then a parallel decoder to generate all 60 timesteps at once. DONUT uses autoregressive token-level prediction with TRSM x 2 attention per step.
+
+This project **merges the encoder's spatial BiMamba into the decoder's autoregressive loop** as the S (social/spatial) component, using a `[T-R-BiMamba-M] x 2` attention pattern per AR step. The Proposer and Refiner replace the original Round 1 and Round 2:
+
+- **T (Temporal)**: Cross-attention -- current token queries the accumulated token sequence for temporal context
+- **R (Road/Scene)**: Cross-attention -- mode tokens attend to scene encoding (agents + lanes)
+- **BiMamba (Social/Spatial)**: Bidirectional Mamba scanning over sorted `[scene_tokens + mode_tokens]`, **updating all tokens** -- provides implicit social + spatial interaction, replacing both DONUT's S and part of R
+- **M (Mode)**: Self-attention among 6 modes with learnable mode/time embeddings
 
 ## Architecture
 
-### Encoder (FINet, with heading-enriched input)
+### Encoder (lightweight, no BiMamba)
+
+The encoder only extracts per-token local features. All cross-agent spatial interaction is deferred to the decoder's BiMamba.
 
 ```
 Raw Input (AV2)
@@ -23,135 +32,175 @@ Raw Input (AV2)
     +-- Agent History [B, N, 50, 7]
     |     (pos_diff_x, pos_diff_y, vel_diff, valid_mask,
     |      heading_diff, cos(heading), sin(heading))
-    |     -> hist_embed_mlp -> Unidirectional Mamba (4 blocks) -> actor_feat [B, N, 128]
+    |     -> MLP(7->64->128) -> UniMamba (4 blocks) -> actor_feat [B, N, 128]
+    |     (temporal encoding only, no cross-agent interaction)
     |
     +-- Lane Map -> LaneEmbeddingLayer (Conv1d) -> lane_feat [B, M, 128]
     |
-    +-- Position/Type Embeddings -> scene context x_encoder [B, 173, 128]
+    +-- Position/Type Embeddings -> x_encoder [B, N+M, 128] -> LayerNorm
+
+decoder0(ego_token) -> ep_offset_1 (coarse endpoint for initial sorting)
+mode_tokens = ego_token x 6 + learnable_tokens + ep_tok (FINet-style init)
 ```
 
-### Forward Flow: Round1 -> Proposer -> Round2 -> Refiner
-
-The two-round spatial Mamba is split by the Proposer, enabling the Refiner to receive endpoint-aware scene encoding:
+### Forward Flow: Encode -> Proposer -> Refiner
 
 ```
-x_encoder [B, 173, 128]
+x_encoder [B, 173, 128]  (no spatial context yet -- agents don't see each other)
     |
-    === Round 1: spatial_mamba_round1 ===
-    decoder0 predicts coarse endpoint -> sort scene tokens -> biMamba (4 blocks)
-    -> x_encoder_r1 [B, 173, 128] + mode_r1 [B, 6, 128]
+    === Proposer ("new Round 1") ===
+    init sort_center = ego_pos + ep_offset_1 (decoder0 coarse endpoint)
+    6 AR steps, each: [T-R-BiMamba-M] x 2
+    -> BiMamba builds spatial context from scratch at each step
+    -> scene_encoding evolves through 6 steps (agents learn about each other)
+    -> y_hat [B, 6, 60, 2] + heading_hat + pi + proposer_feats
     |
-    === Proposer (6 AR steps, using Round 1 encoding) ===
-    -> y_hat [B, 6, 60, 2] + heading_hat [B, 6, 60] + pi [B, 6]
+    proposer_endpoint = softmax(pi) * y_hat[:,:,-1,:] [detached]
     |
-    Pi-weighted endpoint = sum(softmax(pi) * y_hat[:,:,-1,:])  [detached]
-    |
-    === Round 2: spatial_mamba_round2 ===
-    Re-sort by Proposer endpoint -> biMamba (2 blocks)
-    -> x_encoder_r2 [B, 173, 128] + mode_r2 [B, 6, 128]
-    |
-    === Refiner (6 AR steps, using Round 2 encoding) ===
-    + feature fusion from proposer
-    + residual correction in local coordinate frame
-    -> new_y_hat [B, 6, 60, 2] + new_heading_hat [B, 6, 60] + new_pi [B, 6]
+    === Refiner ("new Round 2") ===
+    init sort_center = proposer_endpoint (Proposer-informed sorting)
+    scene_encoding = original x_encoder (independent, fresh start)
+    6 AR steps, each: [T-R-BiMamba-M] x 2
+    + feature fusion from proposer (proposer_feats, with gradient)
+    + residual correction on proposed trajectories (detached)
+    -> new_y_hat + new_heading_hat + new_pi
 ```
 
-### Autoregressive Decoder Detail
-
-Each AR step within Proposer/Refiner:
+### Decoder Detail: Each AR Step
 
 ```
-For step = 1..6 (each producing 10 timesteps):
+For step = 0..5 (each producing 10 timesteps):
+
     Tokenize (Fourier Embedding, 8-dim input)
       -> pos_delta, velocity, rel_pos, heading, heading_delta, head_vs_motion
       |
-    Mamba-T: unidirectional, causal on accumulated token sequence
+    [T-R-BiMamba-M] x 2:
       |
-    CrossAttn-R: attend to scene encoding (agents + lanes)
+      T: tok(Q) x token_seq(KV)  -- cross-attention
+         current token queries [hist, tok_0, ..., tok_k] for temporal context
+         (no causal mask needed -- seq only contains past/current steps)
       |
-    ModeAttn-M: self-attention among 6 modes with mode/time embeddings
+      R: tok(Q) x scene_encoding(KV)  -- cross-attention
+         mode tokens attend to scene for road/agent information
+      |
+      BiMamba: sort scene by pi-weighted prediction position
+               -> cat([sorted_scene, tok]) -> BiMamba bidirectional scan
+               -> update BOTH scene and mode tokens (social interaction)
+               -> scatter restore scene to original order
+      |
+      M: self-attention among 6 modes + mode/time embeddings
+      |
+    Write updated tok back into token_seq for next rep/step
       |
     Detokenize -> pos_delta + heading_delta + scale + concentration
-                  (normal t_per_tok=10 steps + over-prediction t_per_tok=10 steps)
+                  (normal 10 steps + over-prediction 10 steps)
       |
     Local coordinate transform:
       Proposer: cumsum(pos_delta), cumsum(0.3*tanh(head_delta)) -> local_to_global
       Refiner:  proposed_chunk(local) + residual -> local_to_global
       |
-    Feed back to next step (detached)
+    Update sort_center = softmax(pi) * positions[:,:,-1,:] for next step
 ```
 
-### Interaction Design
+### Design Rationale
 
-| Type | Implementation | Role |
-|------|---------------|------|
-| **T (Temporal)** | Unidirectional Mamba (`bimamba=False`) | Causal temporal modeling over token history |
-| **R (Road/Scene)** | `Cross_Block` (MultiheadAttention) | Query scene context (agents + lanes) |
-| **S (Social)** | Not included | Already handled by `spatial_mamba` in encoder |
-| **M (Mode)** | Self-attention + `mode_emb` + `time_emb` | Differentiate and interact among 6 modes |
+**Why move BiMamba from encoder to decoder?**
 
-### DONUT Features Adopted
+In the original FINet, BiMamba runs in two fixed encoder rounds (Round 1 + Round 2) that are "blind" to the prediction task. By moving BiMamba into the decoder's AR loop:
 
-| Feature | DONUT | This Project |
-|---------|-------|-------------|
-| Heading prediction | von Mises distribution | Adopted (VonMisesNLLLoss) |
-| Coordinate system | Per-token local (rotate/translate) | Adopted (global_to_local / local_to_global) |
-| Over-prediction | Auxiliary shifted prediction | Adopted (shift=t_per_tok, GT offset 10 steps) |
-| Fourier Embedding | Learnable sinusoidal for continuous features | Adopted (8-dim tokenizer input) |
-| Uncertainty | Cumulative scale/concentration | Adopted (scale cumsum + conc inverse cumsum) |
-| Social attention | Graph-based radius search | Skipped (encoder handles it) |
+1. Spatial interaction is **prediction-aware** from the first step
+2. Scene tokens adapt dynamically to the evolving trajectory prediction
+3. Sorting updates at every AR step (not just twice), providing finer-grained spatial locality
+4. No redundant BiMamba processing (encoder BiMamba + decoder BiMamba was wasteful)
+5. Proposer = "new Round 1", Refiner = "new Round 2" -- same two-stage structure, but integrated with prediction
 
-### Detach Strategy (Cascade R-CNN style)
+**Why Proposer and Refiner start from the same x_encoder independently?**
+
+- Original FINet chains Round 1 → Round 2 (6 BiMamba layers, short gradient path)
+- Chaining Proposer → Refiner would create a 24-layer BiMamba gradient path -- too deep
+- Independent starts let the Refiner build its own spatial understanding, unbiased by Proposer errors
+- The Refiner still benefits from Proposer through: sort_center (endpoint), proposer_feats (feature fusion), proposed_positions/headings (residual targets)
+
+### Comparison with DONUT and FINet
+
+| | FINet (original) | DONUT | This Project |
+|--|------------------|-------|-------------|
+| **Encoder** | BiMamba spatial (2 rounds) | QCNet (Transformer) | Lightweight (no BiMamba) |
+| **Decoder type** | Parallel BiMamba | Autoregressive Transformer | Autoregressive [T-R-BiMamba-M] |
+| **Temporal (T)** | BiMamba (all 60 steps) | Transformer attention + relation emb | Cross-attention (tok→seq) |
+| **Road (R)** | Cross-attention per layer | Transformer attention + relation emb | Cross-attention per rep |
+| **Social (S)** | Implicit in encoder BiMamba | Explicit Transformer attention | BiMamba in decoder (scene updated) |
+| **Mode (M)** | Output logits only | Transformer + embeddings | Self-attention + embeddings |
+| **Depth per step** | N/A (parallel) | TRSM x 2 | [T-R-BiMamba-M] x 2 |
+| **History tokens** | 1 (compressed) | 5 (tokenized from 50 steps) | 1 (compressed) |
+| **Relation embedding** | None | FourierEmbed on pairwise geometry | None |
+| **Heading prediction** | No | Von Mises NLL | Von Mises NLL |
+| **Over-prediction** | No | Yes | Yes |
+| **Position loss** | SmoothL1 | Laplace NLL | Laplace NLL |
+| **Classification** | CrossEntropy | Mixture NLL | Mixture NLL |
+
+### Features Adopted from DONUT
+
+| Feature | Implementation |
+|---------|---------------|
+| Heading prediction | Von Mises distribution (VonMisesNLLLoss) |
+| Per-token local coordinates | global_to_local / local_to_global per AR step |
+| Over-prediction | Auxiliary shifted-GT loss (offset by t_per_tok steps) |
+| Fourier Embedding | Learnable sinusoidal for 8-dim tokenizer input |
+| Uncertainty modeling | Cumulative scale (position) + inverse cumulative concentration (heading) |
+| Mixture NLL classification | -logsumexp(log_pi - NLL) on refiner output |
+
+### Detach Strategy
 
 | Data | Detached? | Reason |
 |------|-----------|--------|
-| Proposer endpoint (for Round 2 sorting) | Yes | Prevent Refiner from manipulating sort order |
-| x_encoder_r1 (into Round 2) | No | Shared backbone, both losses optimize encoder |
-| y_hat (into Refiner) | Yes | Standard two-stage practice |
-| heading_hat (into Refiner) | Yes | Consistent with position detach |
+| Proposer endpoint (for Refiner sorting) | Yes | Prevent Refiner from manipulating sort order |
+| y_hat, heading_hat (into Refiner) | Yes | Standard two-stage practice |
 | proposer_feats (into Refiner) | No | Allow gradient flow for feature fusion |
+| ep_offset_1 (for Proposer sorting) | Yes | Sorting is non-differentiable guidance only |
+
+## TODO
+
+### 1. Multi-token History (from DONUT)
+
+**Current**: 50 history steps are compressed into 1 token via UniMamba (`ego_feat`). The T attention only sees a single history vector.
+
+**DONUT**: Tokenizes 50 steps into 5 history tokens (10 steps each), preserving temporal structure. T attention can selectively attend to different parts of the history (recent vs. older).
+
+**Plan**: Keep UniMamba encoding for each agent, but additionally extract 5 intermediate tokens (one per 10-step chunk) to form a richer history sequence for T. This would change `token_seq` from `[hist, tok_0, ..., tok_k]` (max 7) to `[hist_0, ..., hist_4, tok_0, ..., tok_k]` (max 11), matching DONUT.
+
+### 2. Geometric Relation Embedding (from DONUT)
+
+**Current**: R (CrossAttn) and BiMamba use standard attention / Mamba scanning without pairwise geometric relation information. Spatial awareness comes only from position embeddings on tokens and BiMamba's sorting order.
+
+**DONUT**: Every attention type (T/R/S/M) injects pairwise geometric relations via FourierEmbedding:
+```
+relation = FourierEmbed([distance, direction, relative_heading])  -> 128d
+K = K + Linear_k(relation)   # injected into Key
+V = V + Linear_v(relation)   # injected into Value
+```
+
+This provides explicit "who is where, facing which direction" information that pure position embeddings cannot capture (e.g., distinguishing "car ahead approaching" vs "car behind following").
+
+**Plan**: Add a `RelationalCrossBlock` for R attention that computes pairwise geometric relations between mode tokens and scene tokens, then injects them into K and V via FourierEmbedding. BiMamba cannot directly support relation embeddings (not attention-based), but R with relations + BiMamba with sorting provides complementary coverage.
 
 ## File Structure
 
-### New Files
+### Key Files
 
-- `src/model/layers/coordinate_transforms.py` — `wrap_angle`, `global_to_local`, `local_to_global`
-- `src/model/layers/fourier_embedding.py` — Learnable Fourier Embedding (8-dim -> sin/cos -> per-feature MLP -> sum -> 128-dim)
-- `src/utils/VonMisesNLLLoss.py` — Von Mises NLL loss for heading prediction (adapted from DONUT)
+| File | Role |
+|------|------|
+| `src/model/model_forecast.py` | Main model: lightweight encoder + decoder0 + Proposer/Refiner calls |
+| `src/model/layers/donut_decoder.py` | `AutoregressiveStage` ([T-R-BiMamba-M]x2), `DonutMambaDecoder` (proposer+refiner) |
+| `src/model/trainer_forecast.py` | Loss computation (Laplace + VonMises + Mixture NLL + over-prediction) |
+| `src/model/layers/coordinate_transforms.py` | `wrap_angle`, `global_to_local`, `local_to_global` |
+| `src/model/layers/fourier_embedding.py` | Learnable Fourier Embedding (8-dim -> 128-dim) |
+| `src/model/layers/transformer_blocks.py` | `Cross_Block` (reused for both T and R attention) |
+| `src/model/layers/mamba/vim_mamba.py` | `create_block` (BiMamba / UniMamba) |
+| `src/utils/LaplaceNLLLoss.py` | Laplace NLL for position regression |
+| `src/utils/VonMisesNLLLoss.py` | Von Mises NLL for heading regression |
 
-### Modified Files
-
-- `src/datamodule/av2_dataset.py`:
-  - Preserves future heading GT as `target_heading` [N, 60]
-  - Computes historical `x_heading_diff` [N, 50]
-  - Updated collate_fn for new keys
-
-- `src/model/model_forecast.py`:
-  - Encoder input expanded from 4-dim to 7-dim (+ heading_diff, cos/sin heading)
-  - `spatial_mamba()` split into `spatial_mamba_round1()` + `spatial_mamba_round2()`
-  - `forward()` restructured: Round1 -> Proposer -> Round2 -> Refiner
-  - Proposer uses Round 1 encoding, Refiner uses Round 2 encoding
-  - `decoder1` removed; Round 2 sorts by pi-weighted Proposer endpoint
-
-- `src/model/layers/donut_decoder.py`:
-  - `SimpleTokenizer`: 8-dim features with Fourier Embedding (pos + heading features)
-  - `SimpleDetokenizer`: outputs position + heading + scale + concentration, with over-prediction support
-  - `AutoregressiveStage`: per-token local coordinate transforms, heading prediction, over-prediction
-  - `DonutMambaDecoder`: returns dict with all outputs (normal + over-prediction)
-
-- `src/model/trainer_forecast.py`:
-  - Added `VonMisesNLLLoss` for heading regression
-  - `cal_loss`: heading reg loss (proposer + refiner) + over-prediction shifted loss
-  - `compute_cls_nll`: joint position + heading NLL for mode classification
-  - Diagnostics: heading MAE in degrees
-
-### Unchanged
-
-- `src/model/layers/transformer_blocks.py` — `Cross_Block` reused as-is
-- `src/model/layers/mamba/vim_mamba.py` — `create_block` reused as-is
-- `src/metrics/` — All metric classes unchanged (only use y_hat and pi)
-
-## Key Hyperparameters
+## Hyperparameters
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
@@ -159,11 +208,14 @@ For step = 1..6 (each producing 10 timesteps):
 | `t_per_tok` | 10 | Timesteps aggregated per token |
 | `future_steps` | 60 | Prediction horizon (6s @ 10Hz) |
 | `num_modes` | 6 | Multi-modal trajectory hypotheses |
-| `dec_layer_1` | 4 | Mamba blocks in proposer |
-| `dec_layer_2` | 4 | Mamba blocks in refiner |
-| `enc_layer_1` | 4 | Spatial Mamba blocks (round 1) |
-| `enc_layer_2` | 2 | Spatial Mamba blocks (round 2) |
-| `over_predict` | 1 | Over-prediction enabled (extra t_per_tok steps) |
+| `dec_layer_1` | 2 | [T-R-BiMamba-M] repetitions in proposer |
+| `dec_layer_2` | 2 | [T-R-BiMamba-M] repetitions in refiner |
+| `over_predict` | 1 | Over-prediction enabled |
+| `lr` | 0.002 | Learning rate (AdamW) |
+| `weight_decay` | 0.01 | L2 regularization |
+| `gradient_clip_val` | 5.0 | Gradient norm clipping |
+| `batch_size` | 256 | Training batch size |
+| `warmup_epochs` | 10 | Linear LR warmup |
 
 ## Loss Components
 
