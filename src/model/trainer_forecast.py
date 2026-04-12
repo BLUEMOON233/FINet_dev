@@ -159,27 +159,85 @@ class Trainer(pl.LightningModule):
                      on_step=False, on_epoch=True, batch_size=B)
 
     @torch.no_grad()
+    def _grad_sq_norm(self, grad: torch.Tensor) -> torch.Tensor:
+        if grad.is_sparse:
+            grad = grad.coalesce().values()
+        grad = grad.detach().float()
+        return torch.sum(grad * grad)
+
+    @torch.no_grad()
     def _log_gradient_norms(self):
-        """Log gradient norms for encoder vs decoder to check training balance."""
-        enc_grad_norm = 0.0
-        enc_count = 0
-        dec_grad_norm = 0.0
-        dec_count = 0
+        """Log decoder gradient health with a focus on BiMamba and clipping pressure."""
+        device = self.device
+        global_sq = torch.zeros((), device=device)
+        proposer_bimamba_sq = torch.zeros((), device=device)
+        refiner_bimamba_sq = torch.zeros((), device=device)
 
         for name, param in self.net.named_parameters():
-            if param.grad is not None:
-                norm = param.grad.data.norm(2).item()
-                if "time_decoder" in name:
-                    dec_grad_norm += norm ** 2
-                    dec_count += 1
-                else:
-                    enc_grad_norm += norm ** 2
-                    enc_count += 1
+            if param.grad is None:
+                continue
 
-        if enc_count > 0:
-            self.log("train/grad_norm_encoder", enc_grad_norm ** 0.5, on_step=True, on_epoch=False)
-        if dec_count > 0:
-            self.log("train/grad_norm_decoder", dec_grad_norm ** 0.5, on_step=True, on_epoch=False)
+            grad_sq = self._grad_sq_norm(param.grad)
+            global_sq = global_sq + grad_sq
+
+            if name.startswith("time_decoder.proposer.bimamba_"):
+                proposer_bimamba_sq = proposer_bimamba_sq + grad_sq
+            elif name.startswith("time_decoder.refiner.bimamba_"):
+                refiner_bimamba_sq = refiner_bimamba_sq + grad_sq
+
+        global_grad_norm = torch.sqrt(global_sq)
+        proposer_bimamba_grad_norm = torch.sqrt(proposer_bimamba_sq)
+        refiner_bimamba_grad_norm = torch.sqrt(refiner_bimamba_sq)
+
+        clip_val = getattr(self.trainer, "gradient_clip_val", None)
+        if clip_val is None or clip_val <= 0:
+            clip_indicator = torch.zeros((), device=device)
+            clip_ratio = torch.zeros((), device=device)
+        else:
+            clip_threshold = torch.tensor(float(clip_val), device=device)
+            clip_indicator = (global_grad_norm > clip_threshold).float()
+            clip_ratio = global_grad_norm / clip_threshold.clamp_min(1e-12)
+
+        self.log(
+            "train/global_grad_norm",
+            global_grad_norm,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=False,
+            sync_dist=True,
+        )
+        self.log(
+            "train/proposer_bimamba_grad_norm",
+            proposer_bimamba_grad_norm,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=False,
+            sync_dist=True,
+        )
+        self.log(
+            "train/refiner_bimamba_grad_norm",
+            refiner_bimamba_grad_norm,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=False,
+            sync_dist=True,
+        )
+        self.log(
+            "train/grad_clip_indicator",
+            clip_indicator,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=False,
+            sync_dist=True,
+        )
+        self.log(
+            "train/grad_clip_ratio",
+            clip_ratio,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=False,
+            sync_dist=True,
+        )
 
     # ------------------------------------------------------------------ #
     #                            Loss Computation                         #
@@ -359,9 +417,7 @@ class Trainer(pl.LightningModule):
         return loss
 
     def on_after_backward(self):
-        # Log gradient norms every 100 steps
-        if self.global_step % 100 == 0:
-            self._log_gradient_norms()
+        self._log_gradient_norms()
 
     def validation_step(self, data, batch_idx):
         if isinstance(data, list):

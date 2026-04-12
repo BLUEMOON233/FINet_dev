@@ -225,6 +225,26 @@ class ModelForecast(nn.Module):
         ego_feat = x_encoder[:, 0]
         init_heading = data["x_angles"][:, 0, -1]
 
+        ego_history_positions = data["x_positions"][:, 0]
+        ego_history_headings = data["x_angles"][:, 0]
+        ego_history_mask = data["x_valid_mask"][:, 0]
+        hist_steps = ego_history_positions.shape[1]
+        if hist_steps % self.t_per_tok != 0:
+            raise ValueError(
+                f"ego history length ({hist_steps}) must be divisible by t_per_tok ({self.t_per_tok})"
+            )
+        num_hist_tokens = hist_steps // self.t_per_tok
+        ego_history_positions = ego_history_positions.reshape(B, num_hist_tokens, self.t_per_tok, 2)
+        ego_history_headings = ego_history_headings.reshape(B, num_hist_tokens, self.t_per_tok)
+        ego_history_mask = ego_history_mask.reshape(B, num_hist_tokens, self.t_per_tok)
+
+        proposer_history_positions = ego_history_positions[:, :-1]
+        proposer_history_headings = ego_history_headings[:, :-1]
+        proposer_history_mask = ego_history_mask[:, :-1]
+        refiner_history_positions = ego_history_positions[:, 1:]
+        refiner_history_headings = ego_history_headings[:, 1:]
+        refiner_history_mask = ego_history_mask[:, 1:]
+
         ###### Proposer (init sort by decoder0 endpoint) ######
         proposer_sort_center = x_centers[:, 0] + ep_offset_1.detach()
 
@@ -239,6 +259,9 @@ class ModelForecast(nn.Module):
                 valid_mask=valid_mask,
                 init_sort_center=proposer_sort_center,
                 init_heading=init_heading,
+                history_positions=proposer_history_positions,
+                history_headings=proposer_history_headings,
+                history_mask=proposer_history_mask,
             )
 
         ###### Pi-weighted endpoint for Refiner sorting (detached) ######
@@ -268,6 +291,9 @@ class ModelForecast(nn.Module):
                 proposed_headings=heading_hat.detach(),
                 proposer_feats=proposer_feats,
                 init_heading=init_heading,
+                history_positions=refiner_history_positions,
+                history_headings=refiner_history_headings,
+                history_mask=refiner_history_mask,
             )
 
         return {

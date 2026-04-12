@@ -118,9 +118,106 @@ class SimpleDetokenizer(nn.Module):
         return pos_delta, scale, head_delta, conc
 
 
+class RelationAwareTemporalAttention(nn.Module):
+    """
+    Temporal cross-attention from the current token to the token sequence,
+    augmented with relative geometry and relative time features.
+    """
+
+    def __init__(self, embed_dim=128, num_heads=8, drop_path=0.2):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.rel_emb = FourierEmbedding(input_dim=4, hidden_dim=embed_dim)
+        self.norm_q = nn.LayerNorm(embed_dim)
+        self.norm_kv = nn.LayerNorm(embed_dim)
+        self.to_q = nn.Linear(embed_dim, embed_dim)
+        self.to_k = nn.Linear(embed_dim, embed_dim)
+        self.to_v = nn.Linear(embed_dim, embed_dim)
+        self.to_k_rel = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.to_v_rel = nn.Linear(embed_dim, embed_dim)
+        self.to_bias = nn.Linear(embed_dim, num_heads)
+        self.to_s = nn.Linear(embed_dim, embed_dim)
+        self.to_g = nn.Linear(embed_dim * 2, embed_dim)
+        self.to_out = nn.Linear(embed_dim, embed_dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Linear(embed_dim * 4, embed_dim),
+        )
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+
+    def forward(
+        self,
+        query,
+        seq,
+        query_pos,
+        query_head,
+        seq_pos,
+        seq_head,
+        query_time,
+        seq_time,
+        key_padding_mask=None,
+    ):
+        B, M, D = query.shape
+        S = seq.shape[2]
+        BM = B * M
+
+        query_norm = self.norm_q(query).reshape(BM, D)
+        seq_norm = self.norm_kv(seq).reshape(BM, S, D)
+        query_pos = query_pos.reshape(BM, 2)
+        query_head = query_head.reshape(BM)
+        seq_pos = seq_pos.reshape(BM, S, 2)
+        seq_head = seq_head.reshape(BM, S)
+        query_time = query_time.reshape(BM)
+        seq_time = seq_time.reshape(BM, S)
+
+        rel_pos = seq_pos - query_pos.unsqueeze(1)
+        dist = torch.linalg.norm(rel_pos, dim=-1)
+
+        query_head_cos = query_head.cos().unsqueeze(1)
+        query_head_sin = query_head.sin().unsqueeze(1)
+        cross = query_head_cos * rel_pos[..., 1] - query_head_sin * rel_pos[..., 0]
+        dot = query_head_cos * rel_pos[..., 0] + query_head_sin * rel_pos[..., 1]
+        direction = torch.atan2(cross, dot)
+        rel_head = wrap_angle(seq_head - query_head.unsqueeze(1))
+        time_rel = (seq_time - query_time.unsqueeze(1)).to(query.dtype)
+
+        rel_feat = torch.stack([dist, direction, rel_head, time_rel], dim=-1)
+        rel_emb = self.rel_emb(rel_feat)
+
+        q = self.to_q(query_norm).reshape(BM, self.num_heads, self.head_dim)
+        k = self.to_k(seq_norm).reshape(BM, S, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.to_v(seq_norm).reshape(BM, S, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k_rel = self.to_k_rel(rel_emb).reshape(BM, S, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v_rel = self.to_v_rel(rel_emb).reshape(BM, S, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        bias = self.to_bias(rel_emb).permute(0, 2, 1)
+
+        logits = (q.unsqueeze(2) * (k + k_rel)).sum(dim=-1) * self.scale + bias
+        if key_padding_mask is not None:
+            mask = key_padding_mask.reshape(BM, S).unsqueeze(1)
+            logits = logits.masked_fill(mask, torch.finfo(logits.dtype).min)
+        attn = F.softmax(logits, dim=-1)
+        attn = F.dropout(attn, p=0.1, training=self.training)
+
+        attn_out = (attn.unsqueeze(-1) * (v + v_rel)).sum(dim=2).reshape(BM, D)
+        attn_out = self.to_out(attn_out)
+        gate = torch.sigmoid(self.to_g(torch.cat([attn_out, query_norm], dim=-1)))
+        attn_out = attn_out + gate * (self.to_s(query_norm) - attn_out)
+        attn_out = attn_out.reshape(B, M, D)
+
+        x = query + self.drop_path(attn_out)
+        x = x + self.drop_path2(self.mlp(x))
+        return x
+
+
 class ModeAttention(nn.Module):
     """
-    Self-attention among modes at each autoregressive step.
+    Relation-aware self-attention among modes at each autoregressive step.
     """
 
     def __init__(
@@ -132,9 +229,22 @@ class ModeAttention(nn.Module):
         drop_path=0.2,
     ):
         super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.scale = self.head_dim ** -0.5
         self.mode_emb = nn.Embedding(num_modes, embed_dim)
         self.time_emb = nn.Embedding(num_pred_steps + 1, embed_dim)
+        self.rel_emb = FourierEmbedding(input_dim=3, hidden_dim=embed_dim)
         self.norm = nn.LayerNorm(embed_dim)
+        self.to_q = nn.Linear(embed_dim, embed_dim)
+        self.to_k = nn.Linear(embed_dim, embed_dim)
+        self.to_v = nn.Linear(embed_dim, embed_dim)
+        self.to_k_rel = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.to_v_rel = nn.Linear(embed_dim, embed_dim)
+        self.to_bias = nn.Linear(embed_dim, num_heads)
+        self.to_s = nn.Linear(embed_dim, embed_dim)
+        self.to_g = nn.Linear(embed_dim * 2, embed_dim)
+        self.to_out = nn.Linear(embed_dim, embed_dim)
         self.attn = nn.MultiheadAttention(
             embed_dim,
             num_heads,
@@ -150,7 +260,7 @@ class ModeAttention(nn.Module):
         )
         self.drop_path2 = DropPath(drop_path) if drop_path > 0 else nn.Identity()
 
-    def forward(self, x, pred_step):
+    def forward(self, x, pred_step, mode_pos=None, mode_head=None):
         mode_ids = torch.arange(x.shape[1], device=x.device)
         time_ids = torch.full((1,), pred_step, device=x.device, dtype=torch.long)
 
@@ -158,7 +268,52 @@ class ModeAttention(nn.Module):
         x = x + self.time_emb(time_ids).view(1, 1, -1)
 
         x_norm = self.norm(x)
-        attn_out = self.attn(x_norm, x_norm, x_norm)[0]
+        if mode_pos is None or mode_head is None:
+            attn_out = self.attn(x_norm, x_norm, x_norm)[0]
+        else:
+            rel_pos = mode_pos[:, None, :, :] - mode_pos[:, :, None, :]  # key - query
+            dist = torch.linalg.norm(rel_pos, dim=-1)
+
+            query_head_cos = mode_head.cos()
+            query_head_sin = mode_head.sin()
+            cross = (
+                query_head_cos[:, :, None] * rel_pos[..., 1]
+                - query_head_sin[:, :, None] * rel_pos[..., 0]
+            )
+            dot = (
+                query_head_cos[:, :, None] * rel_pos[..., 0]
+                + query_head_sin[:, :, None] * rel_pos[..., 1]
+            )
+            direction = torch.atan2(cross, dot)
+            rel_head = wrap_angle(mode_head[:, None, :] - mode_head[:, :, None])
+
+            rel_feat = torch.stack([dist, direction, rel_head], dim=-1)
+            rel_emb = self.rel_emb(rel_feat)
+
+            B, M, D = x_norm.shape
+            q = self.to_q(x_norm).reshape(B, M, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+            k = self.to_k(x_norm).reshape(B, M, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+            v = self.to_v(x_norm).reshape(B, M, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+            k_rel = self.to_k_rel(rel_emb).reshape(B, M, M, self.num_heads, self.head_dim)
+            v_rel = self.to_v_rel(rel_emb).reshape(B, M, M, self.num_heads, self.head_dim)
+            bias = self.to_bias(rel_emb).permute(0, 3, 1, 2)
+
+            k_rel = k_rel.permute(0, 3, 1, 2, 4)
+            v_rel = v_rel.permute(0, 3, 1, 2, 4)
+
+            logits = (
+                q.unsqueeze(3) * (k.unsqueeze(2) + k_rel)
+            ).sum(dim=-1) * self.scale + bias
+            attn = F.softmax(logits, dim=-1)
+            attn = F.dropout(attn, p=0.1, training=self.training)
+
+            attn_out = (attn.unsqueeze(-1) * (v.unsqueeze(2) + v_rel)).sum(dim=3)
+            attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, M, D)
+            attn_out = self.to_out(attn_out)
+            gate = torch.sigmoid(self.to_g(torch.cat([attn_out, x_norm], dim=-1)))
+            attn_out = attn_out + gate * (self.to_s(x_norm) - attn_out)
+
         x = x + self.drop_path(attn_out)
         x = x + self.drop_path2(self.mlp(x))
         return x
@@ -166,9 +321,9 @@ class ModeAttention(nn.Module):
 
 class AutoregressiveStage(nn.Module):
     """
-    One autoregressive decoding stage: [T-R-BiMamba-M] x num_repetitions.
-    T = CrossAttention (tok queries seq), R = CrossAttention (tok queries scene),
-    BiMamba = spatial interaction (sorted scene + modes, update all),
+    One autoregressive decoding stage: [T-BiMamba-M] x num_repetitions per AR step.
+    T = CrossAttention (tok queries temporal token sequence),
+    BiMamba = spatial interaction (sorted scene + modes, update all, FINet-style residual),
     M = ModeAttention.
     With per-token local coordinate transforms, heading prediction,
     and over-prediction.
@@ -195,20 +350,44 @@ class AutoregressiveStage(nn.Module):
         self.over_predict = over_predict
 
         self.tokenizer = SimpleTokenizer(embed_dim=embed_dim, t_per_tok=t_per_tok)
+        self.history_adapter_blocks = nn.ModuleList([
+            create_block(
+                d_model=embed_dim,
+                layer_idx=i,
+                drop_path=drop_path,
+                bimamba=False,
+                rms_norm=True,
+            )
+            for i in range(1)
+        ])
+        self.history_adapter_norm = RMSNorm(embed_dim, eps=1e-5)
+        self.history_adapter_drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+        self.history_to_mode = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
 
-        # T: Causal self-attention on token sequence (reuse Cross_Block)
+        # T: relation-aware attention from current token to temporal token sequence
         self.temporal_attns = nn.ModuleList([
-            Cross_Block(dim=embed_dim, num_heads=num_heads, drop_path=drop_path)
+            RelationAwareTemporalAttention(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                drop_path=drop_path,
+            )
             for _ in range(num_repetitions)
         ])
 
-        # R: Cross-attention to scene encoding
+        # Kept for checkpoint compatibility, but disabled in the current
+        # T-BiMamba-M design where scene interaction is handled by BiMamba.
         self.cross_attns = nn.ModuleList([
             Cross_Block(dim=embed_dim, num_heads=num_heads, drop_path=drop_path)
             for _ in range(num_repetitions)
         ])
 
         # BiMamba: spatial interaction (scene + mode tokens, bidirectional)
+        # FINet-style residual within each block
         self.bimamba_blocks = nn.ModuleList([
             create_block(
                 d_model=embed_dim, layer_idx=i,
@@ -250,6 +429,20 @@ class AutoregressiveStage(nn.Module):
                 nn.ReLU(),
                 nn.Linear(embed_dim, embed_dim),
             )
+            self.future_query_scene_attn = Cross_Block(
+                dim=embed_dim,
+                num_heads=num_heads,
+                drop_path=drop_path,
+            )
+            self.future_query_mamba = create_block(
+                d_model=embed_dim,
+                layer_idx=0,
+                drop_path=drop_path,
+                bimamba=False,
+                rms_norm=True,
+            )
+            self.future_query_norm = RMSNorm(embed_dim, eps=1e-5)
+            self.future_query_drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
 
     def _sort_scene_by_center(self, scene_encoding, x_centers, valid_mask, center):
         """Sort scene tokens by distance to *center*; return sorted tensor + undo indices."""
@@ -273,6 +466,252 @@ class AutoregressiveStage(nn.Module):
             sorted_scene,
         )
 
+    def _encode_history_tokens(
+        self,
+        history_positions,
+        history_headings,
+        history_mask,
+    ):
+        """Tokenize chunked ego history into a temporal token sequence."""
+        hist_anchor_pos = history_positions[:, :, -1:, :]
+        hist_anchor_head = history_headings[:, :, -1:]
+        hist_local_pos, hist_local_head = global_to_local(
+            history_positions,
+            history_headings,
+            hist_anchor_pos,
+            hist_anchor_head,
+        )
+        hist_tokens = self.tokenizer(hist_local_pos, hist_local_head)
+        hist_token_mask = history_mask.all(dim=-1)
+        hist_tokens = hist_tokens * hist_token_mask.unsqueeze(-1)
+        return hist_tokens, hist_token_mask
+
+    def _adapt_history_tokens(self, hist_tokens, hist_token_mask):
+        """Build a lightweight, stage-specific history state before rollout."""
+        if hist_tokens.size(1) == 0:
+            hist_state = hist_tokens.new_zeros(hist_tokens.size(0), hist_tokens.size(-1))
+            return hist_tokens, hist_state
+
+        x = hist_tokens
+        residual = None
+        hist_mask = hist_token_mask.unsqueeze(-1)
+        for blk in self.history_adapter_blocks:
+            x, residual = blk(x, residual)
+            x = x * hist_mask
+
+        fused_fn = rms_norm_fn if isinstance(self.history_adapter_norm, RMSNorm) else layer_norm_fn
+        x = fused_fn(
+            self.history_adapter_drop_path(x),
+            self.history_adapter_norm.weight,
+            self.history_adapter_norm.bias,
+            eps=self.history_adapter_norm.eps,
+            residual=residual,
+            prenorm=False,
+            residual_in_fp32=True,
+        )
+        x = x * hist_mask
+
+        valid_counts = hist_token_mask.long().sum(dim=1).clamp(min=1)
+        batch_idx = torch.arange(x.size(0), device=x.device)
+        hist_state = x[batch_idx, valid_counts - 1]
+        return x, hist_state
+
+    def _refine_future_tokens(self, feat_stack, scene_encoding, scene_mask):
+        """Inject scene memory into the full future-token sequence, then smooth it temporally."""
+        B, M, S, D = feat_stack.shape
+        future_queries = feat_stack.reshape(B, M * S, D)
+        future_queries = self.future_query_scene_attn(
+            future_queries,
+            scene_encoding,
+            key_padding_mask=scene_mask,
+        )
+
+        future_seq = future_queries.reshape(B * M, S, D)
+        residual = None
+        future_seq, residual = self.future_query_mamba(future_seq, residual)
+        fused_fn = rms_norm_fn if isinstance(self.future_query_norm, RMSNorm) else layer_norm_fn
+        future_seq = fused_fn(
+            self.future_query_drop_path(future_seq),
+            self.future_query_norm.weight,
+            self.future_query_norm.bias,
+            eps=self.future_query_norm.eps,
+            residual=residual,
+            prenorm=False,
+            residual_in_fp32=True,
+        )
+        return future_seq.reshape(B, M, S, D)
+
+    def _decode_token_geometry(
+        self,
+        tok,
+        anchor_pos,
+        anchor_head,
+        step_idx,
+        proposed_positions=None,
+        proposed_headings=None,
+    ):
+        """Decode one token chunk into positions/headings for geometry-aware mode interaction."""
+        T = self.t_per_tok
+        pos_delta_full, _, head_delta_full, _ = self.detokenizer(tok)
+        pos_delta = pos_delta_full[:, :, :T, :]
+        head_delta = head_delta_full[:, :, :T]
+
+        if self.is_refiner and proposed_positions is not None:
+            start = step_idx * T
+            end = start + T
+            prop_local_pos, prop_local_head = global_to_local(
+                proposed_positions[:, :, start:end, :],
+                proposed_headings[:, :, start:end],
+                anchor_pos.unsqueeze(2),
+                anchor_head.unsqueeze(2),
+            )
+            local_pos = prop_local_pos + pos_delta
+            local_head = wrap_angle(prop_local_head + head_delta)
+        else:
+            local_pos = torch.cumsum(pos_delta, dim=2)
+            local_head = torch.cumsum(0.3 * torch.tanh(head_delta), dim=2)
+
+        positions, headings = local_to_global(
+            local_pos,
+            local_head,
+            anchor_pos.unsqueeze(2),
+            anchor_head.unsqueeze(2),
+        )
+        return positions, headings
+
+    def _decode_token_sequence(
+        self,
+        token_stack,
+        init_heading=None,
+        proposed_positions=None,
+        proposed_headings=None,
+    ):
+        """Decode a future-token sequence back into trajectory distribution parameters."""
+        B, M, S, _ = token_stack.shape
+        T = self.t_per_tok
+        device = token_stack.device
+
+        all_positions = []
+        all_scales = []
+        all_headings = []
+        all_concs = []
+        all_positions_over = []
+        all_scales_over = []
+        all_headings_over = []
+        all_concs_over = []
+
+        anchor_pos = torch.zeros(B, M, 2, device=device)
+        if init_heading is not None:
+            anchor_head = init_heading[:, None].expand(B, M)
+        else:
+            anchor_head = torch.zeros(B, M, device=device)
+
+        for step in range(S):
+            tok = token_stack[:, :, step]
+            pos_delta_full, scale_full, head_delta_full, conc_full = self.detokenizer(tok)
+
+            pos_delta = pos_delta_full[:, :, :T, :]
+            head_delta = head_delta_full[:, :, :T]
+            scale_norm = scale_full[:, :, :T, :]
+            conc_norm = 1.0 / conc_full[:, :, :T].clamp_min(1e-6)
+
+            if self.over_predict:
+                pos_delta_over = pos_delta_full[:, :, T:, :]
+                head_delta_over = head_delta_full[:, :, T:]
+                scale_over = scale_full[:, :, T:, :]
+                conc_over = 1.0 / conc_full[:, :, T:].clamp_min(1e-6)
+
+            if self.is_refiner and proposed_positions is not None:
+                start = step * T
+                end = start + T
+                prop_local_pos, prop_local_head = global_to_local(
+                    proposed_positions[:, :, start:end, :],
+                    proposed_headings[:, :, start:end],
+                    anchor_pos.unsqueeze(2),
+                    anchor_head.unsqueeze(2),
+                )
+                local_pos = prop_local_pos + pos_delta
+                local_head = wrap_angle(prop_local_head + head_delta)
+            else:
+                local_pos = torch.cumsum(pos_delta, dim=2)
+                local_head = torch.cumsum(0.3 * torch.tanh(head_delta), dim=2)
+
+            positions, headings = local_to_global(
+                local_pos,
+                local_head,
+                anchor_pos.unsqueeze(2),
+                anchor_head.unsqueeze(2),
+            )
+
+            all_positions.append(positions)
+            all_scales.append(scale_norm)
+            all_headings.append(headings)
+            all_concs.append(conc_norm)
+
+            if self.over_predict:
+                over_anchor_pos = positions[:, :, -1, :]
+                over_anchor_head = headings[:, :, -1]
+
+                if self.is_refiner and proposed_positions is not None:
+                    over_start = start + T
+                    over_end = min(over_start + T, proposed_positions.shape[2])
+                    actual_len = over_end - over_start
+                    if actual_len > 0:
+                        prop_over_local_pos, prop_over_local_head = global_to_local(
+                            proposed_positions[:, :, over_start:over_end, :],
+                            proposed_headings[:, :, over_start:over_end],
+                            over_anchor_pos.unsqueeze(2),
+                            over_anchor_head.unsqueeze(2),
+                        )
+                        over_local_pos = prop_over_local_pos + pos_delta_over[:, :, :actual_len, :]
+                        over_local_head = wrap_angle(
+                            prop_over_local_head + head_delta_over[:, :, :actual_len]
+                        )
+                    else:
+                        over_local_pos = torch.cumsum(pos_delta_over, dim=2)
+                        over_local_head = torch.cumsum(0.3 * torch.tanh(head_delta_over), dim=2)
+                        actual_len = T
+                else:
+                    over_local_pos = torch.cumsum(pos_delta_over, dim=2)
+                    over_local_head = torch.cumsum(0.3 * torch.tanh(head_delta_over), dim=2)
+                    actual_len = T
+
+                positions_over, headings_over = local_to_global(
+                    over_local_pos,
+                    over_local_head,
+                    over_anchor_pos.unsqueeze(2),
+                    over_anchor_head.unsqueeze(2),
+                )
+
+                all_positions_over.append(positions_over)
+                all_scales_over.append(scale_over[:, :, :actual_len, :])
+                all_headings_over.append(headings_over)
+                all_concs_over.append(conc_over[:, :, :actual_len])
+
+            anchor_pos = positions[:, :, -1, :].detach()
+            anchor_head = headings[:, :, -1].detach()
+
+        y_hat = torch.cat(all_positions, dim=2)
+        scal = torch.cat(all_scales, dim=2)
+        scal = 0.1 + torch.cumsum(scal, dim=2)
+
+        heading_hat = torch.cat(all_headings, dim=2)
+        conc_hat = torch.cat(all_concs, dim=2)
+        conc_hat = 1.0 / (0.02 + torch.cumsum(conc_hat, dim=2))
+
+        if self.over_predict and all_positions_over:
+            y_hat_over = torch.cat(all_positions_over, dim=2)
+            scal_over = torch.cat(all_scales_over, dim=2)
+            scal_over = 0.1 + scal_over
+
+            heading_over = torch.cat(all_headings_over, dim=2)
+            conc_over = torch.cat(all_concs_over, dim=2)
+            conc_over = 1.0 / (0.02 + conc_over)
+        else:
+            y_hat_over = heading_over = scal_over = conc_over = None
+
+        return y_hat, scal, heading_hat, conc_hat, y_hat_over, scal_over, heading_over, conc_over
+
     def forward(
         self,
         mode_tokens,
@@ -286,14 +725,53 @@ class AutoregressiveStage(nn.Module):
         proposed_headings=None,
         proposer_feats=None,
         init_heading=None,
+        history_positions=None,
+        history_headings=None,
+        history_mask=None,
     ):
         B, M, D = mode_tokens.shape
         device = mode_tokens.device
         T = self.t_per_tok
         N_scene = scene_encoding.shape[1]
 
-        hist_token = ego_feat.unsqueeze(1).unsqueeze(2).expand(B, M, 1, -1)
-        token_seq_list = [hist_token]
+        if history_positions is not None and history_headings is not None and history_mask is not None:
+            hist_tokens, hist_token_mask = self._encode_history_tokens(
+                history_positions,
+                history_headings,
+                history_mask,
+            )
+            hist_tokens, hist_state = self._adapt_history_tokens(
+                hist_tokens,
+                hist_token_mask,
+            )
+            hist_seq = hist_tokens.unsqueeze(1).expand(-1, M, -1, -1)
+            hist_seq_mask = hist_token_mask.unsqueeze(1).expand(-1, M, -1)
+            hist_token_pos = history_positions[:, :, -1, :]
+            hist_token_head = history_headings[:, :, -1]
+            hist_seq_pos = hist_token_pos.unsqueeze(1).expand(-1, M, -1, -1)
+            hist_seq_head = hist_token_head.unsqueeze(1).expand(-1, M, -1)
+            hist_seq_time = torch.arange(
+                hist_tokens.size(1),
+                device=device,
+                dtype=torch.long,
+            ).view(1, 1, -1).expand(B, M, -1)
+            init_tok = mode_tokens + self.history_to_mode(hist_state).unsqueeze(1)
+        else:
+            hist_seq = ego_feat.unsqueeze(1).unsqueeze(2).expand(B, M, 1, -1)
+            hist_seq_mask = torch.ones(B, M, 1, device=device, dtype=torch.bool)
+            hist_seq_pos = torch.zeros(B, M, 1, 2, device=device)
+            if init_heading is not None:
+                hist_seq_head = init_heading[:, None, None].expand(B, M, 1)
+            else:
+                hist_seq_head = torch.zeros(B, M, 1, device=device)
+            hist_seq_time = torch.zeros(B, M, 1, device=device, dtype=torch.long)
+            init_tok = mode_tokens
+
+        token_seq_list = [hist_seq]
+        token_valid_list = [hist_seq_mask]
+        token_pos_list = [hist_seq_pos]
+        token_head_list = [hist_seq_head]
+        token_time_list = [hist_seq_time]
 
         all_positions = []
         all_scales = []
@@ -323,7 +801,7 @@ class AutoregressiveStage(nn.Module):
         for step in range(self.num_pred_tokens):
             # ---- Tokenize ----
             if step == 0:
-                tok = mode_tokens
+                tok = init_tok
             else:
                 local_pos, local_head = global_to_local(
                     prev_positions, prev_headings,
@@ -335,19 +813,39 @@ class AutoregressiveStage(nn.Module):
                 tok = tok + self.feature_fuse(proposer_feats[step])
 
             # ---- Append token to sequence ----
+            tok_pos = anchor_pos.unsqueeze(2)
+            tok_head = anchor_head.unsqueeze(2)
+            tok_time = torch.full(
+                (B, M, 1),
+                hist_seq.shape[2] + step,
+                device=device,
+                dtype=torch.long,
+            )
             token_seq_list.append(tok.unsqueeze(2))
+            token_valid_list.append(torch.ones(B, M, 1, device=device, dtype=torch.bool))
+            token_pos_list.append(tok_pos)
+            token_head_list.append(tok_head)
+            token_time_list.append(tok_time)
             seq = torch.cat(token_seq_list, dim=2)  # [B, M, seq_len, D]
+            seq_valid = torch.cat(token_valid_list, dim=2)  # [B, M, seq_len]
+            seq_pos = torch.cat(token_pos_list, dim=2)  # [B, M, seq_len, 2]
+            seq_head = torch.cat(token_head_list, dim=2)  # [B, M, seq_len]
+            seq_time = torch.cat(token_time_list, dim=2)  # [B, M, seq_len]
 
-            # ---- [T → R → BiMamba → M] × num_repetitions ----
+            # ---- [T → BiMamba → M] × num_repetitions ----
             for rep in range(self.num_repetitions):
-                # -- T: tok queries seq (cross-attention, no causal mask needed) --
-                tok_q = tok.reshape(B * M, 1, D)
-                seq_kv = seq.reshape(B * M, -1, D)
-                tok_q = self.temporal_attns[rep](tok_q, seq_kv)
-                tok = tok_q.reshape(B, M, D)
-
-                # -- R: Cross-attention to scene --
-                tok = self.cross_attns[rep](tok, scene_encoding, key_padding_mask=scene_mask)
+                # -- T: tok queries seq with explicit relative geometry/time --
+                tok = self.temporal_attns[rep](
+                    tok,
+                    seq,
+                    query_pos=tok_pos.squeeze(2),
+                    query_head=tok_head.squeeze(2),
+                    seq_pos=seq_pos,
+                    seq_head=seq_head,
+                    query_time=tok_time.squeeze(2),
+                    seq_time=seq_time,
+                    key_padding_mask=~seq_valid,
+                )
 
                 # -- BiMamba: spatial interaction (sorted scene + modes, update all) --
                 sorted_scene, sort_idx = self._sort_scene_by_center(
@@ -371,10 +869,24 @@ class AutoregressiveStage(nn.Module):
                 tok = x_combined[:, N_scene:]  # [B, M, D]
                 scene_encoding = self._unsort_scene(sorted_scene_out, sort_idx)
 
-                # -- M: Mode self-attention --
-                tok = self.mode_attns[rep](tok, step + 1)
+                # -- M: Mode self-attention with relative geometry from the
+                # current chunk endpoint prediction --
+                mode_positions, mode_headings = self._decode_token_geometry(
+                    tok,
+                    anchor_pos,
+                    anchor_head,
+                    step,
+                    proposed_positions=proposed_positions,
+                    proposed_headings=proposed_headings,
+                )
+                tok = self.mode_attns[rep](
+                    tok,
+                    step + 1,
+                    mode_pos=mode_positions[:, :, -1, :],
+                    mode_head=mode_headings[:, :, -1],
+                )
 
-            # Update the last token in sequence with post-[T-R-BiMamba-M] result
+            # Update the last token in sequence with post-[T-BiMamba-M] result
             token_seq_list[-1] = tok.unsqueeze(2)
             step_feats.append(tok)
 
@@ -384,13 +896,15 @@ class AutoregressiveStage(nn.Module):
             pos_delta = pos_delta_full[:, :, :T, :]
             head_delta = head_delta_full[:, :, :T]
             scale_norm = scale_full[:, :, :T, :]
-            conc_norm = conc_full[:, :, :T]
+            # Match DONUT's heading uncertainty parameterization:
+            # accumulate inverse concentration across AR steps, then invert again.
+            conc_norm = 1.0 / conc_full[:, :, :T].clamp_min(1e-6)
 
             if self.over_predict:
                 pos_delta_over = pos_delta_full[:, :, T:, :]
                 head_delta_over = head_delta_full[:, :, T:]
                 scale_over = scale_full[:, :, T:, :]
-                conc_over = conc_full[:, :, T:]
+                conc_over = 1.0 / conc_full[:, :, T:].clamp_min(1e-6)
 
             # ---- Normal: position / heading with local frames ----
             if self.is_refiner and proposed_positions is not None:
@@ -483,6 +997,28 @@ class AutoregressiveStage(nn.Module):
         conc_hat = 1.0 / (0.02 + torch.cumsum(conc_hat, dim=2))
 
         feat_stack = torch.stack(step_feats, dim=2)
+        if self.is_refiner:
+            feat_stack = self._refine_future_tokens(
+                feat_stack,
+                scene_encoding,
+                scene_mask,
+            )
+            step_feats = [feat_stack[:, :, i] for i in range(feat_stack.size(2))]
+            (
+                y_hat,
+                scal,
+                heading_hat,
+                conc_hat,
+                y_hat_over,
+                scal_over,
+                heading_over,
+                conc_over,
+            ) = self._decode_token_sequence(
+                feat_stack,
+                init_heading=init_heading,
+                proposed_positions=proposed_positions,
+                proposed_headings=proposed_headings,
+            )
         feat_pool = feat_stack.max(dim=2)[0]
         pi = self.pi_head(feat_pool).squeeze(-1)
 
@@ -554,8 +1090,20 @@ class DonutMambaDecoder(nn.Module):
             over_predict=over_predict,
         )
 
-    def forward(self, mode_tokens, ego_feat, scene_encoding, mask=None,
-                init_heading=None):
+    def forward(
+        self,
+        mode_tokens,
+        ego_feat,
+        scene_encoding,
+        mask=None,
+        init_heading=None,
+        proposer_history_positions=None,
+        proposer_history_headings=None,
+        proposer_history_mask=None,
+        refiner_history_positions=None,
+        refiner_history_headings=None,
+        refiner_history_mask=None,
+    ):
         # Stage 1: Proposer
         (y_hat, pi, scal, proposer_feats, heading_hat, conc_hat,
          y_hat_over, scal_over, heading_over, conc_over) = self.proposer(
@@ -564,6 +1112,9 @@ class DonutMambaDecoder(nn.Module):
             scene_encoding=scene_encoding,
             scene_mask=mask,
             init_heading=init_heading,
+            history_positions=proposer_history_positions,
+            history_headings=proposer_history_headings,
+            history_mask=proposer_history_mask,
         )
 
         # Stage 2: Refiner
@@ -577,6 +1128,9 @@ class DonutMambaDecoder(nn.Module):
             proposed_headings=heading_hat.detach(),
             proposer_feats=proposer_feats,
             init_heading=init_heading,
+            history_positions=refiner_history_positions,
+            history_headings=refiner_history_headings,
+            history_mask=refiner_history_mask,
         )
 
         dense_pred = None
