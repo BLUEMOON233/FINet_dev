@@ -12,6 +12,14 @@ from .coordinate_transforms import wrap_angle, global_to_local, local_to_global
 from .fourier_embedding import FourierEmbedding
 
 
+def _safe_signed_angle(cross: torch.Tensor, dot: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """Stable signed angle that avoids atan2(0, 0) and its undefined gradient."""
+    safe_cross = torch.where(valid, cross, torch.zeros_like(cross))
+    safe_dot = torch.where(valid, dot, torch.ones_like(dot))
+    angle = torch.atan2(safe_cross, safe_dot)
+    return torch.where(valid, angle, torch.zeros_like(angle))
+
+
 class SimpleTokenizer(nn.Module):
     """
     Converts `t_per_tok` position+heading steps into one token feature vector.
@@ -48,7 +56,8 @@ class SimpleTokenizer(nn.Module):
         head_sin = headings[..., 1:].sin()
         cross = head_cos * deltas[..., 1] - head_sin * deltas[..., 0]
         dot = head_cos * deltas[..., 0] + head_sin * deltas[..., 1]
-        head_vs_mot = torch.atan2(cross, dot).unsqueeze(-1)          # [*,T-1,1]
+        moving = velocity.squeeze(-1) > 1e-6
+        head_vs_mot = _safe_signed_angle(cross, dot, moving).unsqueeze(-1)  # [*,T-1,1]
 
         features = torch.cat(
             [deltas, velocity, rel_pos, head_val, head_delta, head_vs_mot],
@@ -178,12 +187,13 @@ class RelationAwareTemporalAttention(nn.Module):
 
         rel_pos = seq_pos - query_pos.unsqueeze(1)
         dist = torch.linalg.norm(rel_pos, dim=-1)
+        valid_rel = dist > 1e-6
 
         query_head_cos = query_head.cos().unsqueeze(1)
         query_head_sin = query_head.sin().unsqueeze(1)
         cross = query_head_cos * rel_pos[..., 1] - query_head_sin * rel_pos[..., 0]
         dot = query_head_cos * rel_pos[..., 0] + query_head_sin * rel_pos[..., 1]
-        direction = torch.atan2(cross, dot)
+        direction = _safe_signed_angle(cross, dot, valid_rel)
         rel_head = wrap_angle(seq_head - query_head.unsqueeze(1))
         time_rel = (seq_time - query_time.unsqueeze(1)).to(query.dtype)
 
@@ -198,10 +208,14 @@ class RelationAwareTemporalAttention(nn.Module):
         bias = self.to_bias(rel_emb).permute(0, 2, 1)
 
         logits = (q.unsqueeze(2) * (k + k_rel)).sum(dim=-1) * self.scale + bias
+        all_masked = None
         if key_padding_mask is not None:
             mask = key_padding_mask.reshape(BM, S).unsqueeze(1)
+            all_masked = mask.all(dim=-1, keepdim=True)
             logits = logits.masked_fill(mask, torch.finfo(logits.dtype).min)
         attn = F.softmax(logits, dim=-1)
+        if all_masked is not None:
+            attn = torch.where(all_masked, torch.zeros_like(attn), attn)
         attn = F.dropout(attn, p=0.1, training=self.training)
 
         attn_out = (attn.unsqueeze(-1) * (v + v_rel)).sum(dim=2).reshape(BM, D)
@@ -273,6 +287,7 @@ class ModeAttention(nn.Module):
         else:
             rel_pos = mode_pos[:, None, :, :] - mode_pos[:, :, None, :]  # key - query
             dist = torch.linalg.norm(rel_pos, dim=-1)
+            valid_rel = dist > 1e-6
 
             query_head_cos = mode_head.cos()
             query_head_sin = mode_head.sin()
@@ -284,7 +299,7 @@ class ModeAttention(nn.Module):
                 query_head_cos[:, :, None] * rel_pos[..., 0]
                 + query_head_sin[:, :, None] * rel_pos[..., 1]
             )
-            direction = torch.atan2(cross, dot)
+            direction = _safe_signed_angle(cross, dot, valid_rel)
             rel_head = wrap_angle(mode_head[:, None, :] - mode_head[:, :, None])
 
             rel_feat = torch.stack([dist, direction, rel_head], dim=-1)
@@ -511,9 +526,18 @@ class AutoregressiveStage(nn.Module):
         )
         x = x * hist_mask
 
-        valid_counts = hist_token_mask.long().sum(dim=1).clamp(min=1)
+        reversed_mask = torch.flip(hist_token_mask, dims=[1])
+        last_valid_from_end = reversed_mask.long().argmax(dim=1)
+        valid_counts = hist_token_mask.long().sum(dim=1)
+        last_valid_idx = hist_token_mask.size(1) - 1 - last_valid_from_end
+        last_valid_idx = torch.where(
+            valid_counts > 0,
+            last_valid_idx,
+            torch.zeros_like(last_valid_idx),
+        )
         batch_idx = torch.arange(x.size(0), device=x.device)
-        hist_state = x[batch_idx, valid_counts - 1]
+        hist_state = x[batch_idx, last_valid_idx]
+        hist_state = hist_state * (valid_counts > 0).unsqueeze(-1)
         return x, hist_state
 
     def _refine_future_tokens(self, feat_stack, scene_encoding, scene_mask):
@@ -812,7 +836,6 @@ class AutoregressiveStage(nn.Module):
             if self.is_refiner and proposer_feats is not None:
                 tok = tok + self.feature_fuse(proposer_feats[step])
 
-            # ---- Append token to sequence ----
             tok_pos = anchor_pos.unsqueeze(2)
             tok_head = anchor_head.unsqueeze(2)
             tok_time = torch.full(
@@ -821,11 +844,6 @@ class AutoregressiveStage(nn.Module):
                 device=device,
                 dtype=torch.long,
             )
-            token_seq_list.append(tok.unsqueeze(2))
-            token_valid_list.append(torch.ones(B, M, 1, device=device, dtype=torch.bool))
-            token_pos_list.append(tok_pos)
-            token_head_list.append(tok_head)
-            token_time_list.append(tok_time)
             seq = torch.cat(token_seq_list, dim=2)  # [B, M, seq_len, D]
             seq_valid = torch.cat(token_valid_list, dim=2)  # [B, M, seq_len]
             seq_pos = torch.cat(token_pos_list, dim=2)  # [B, M, seq_len, 2]
@@ -886,10 +904,6 @@ class AutoregressiveStage(nn.Module):
                     mode_head=mode_headings[:, :, -1],
                 )
 
-            # Update the last token in sequence with post-[T-BiMamba-M] result
-            token_seq_list[-1] = tok.unsqueeze(2)
-            step_feats.append(tok)
-
             # ---- Detokenize ----
             pos_delta_full, scale_full, head_delta_full, conc_full = self.detokenizer(tok)
 
@@ -932,6 +946,16 @@ class AutoregressiveStage(nn.Module):
             all_scales.append(scale_norm)
             all_headings.append(headings)
             all_concs.append(conc_norm)
+
+            mem_tok_pos = positions[:, :, -1:, :].detach()
+            mem_tok_head = headings[:, :, -1:].detach()
+
+            token_seq_list.append(tok.unsqueeze(2))
+            token_valid_list.append(torch.ones(B, M, 1, device=device, dtype=torch.bool))
+            token_pos_list.append(mem_tok_pos)
+            token_head_list.append(mem_tok_head)
+            token_time_list.append(tok_time)
+            step_feats.append(tok)
 
             # ---- Over-prediction: extend from normal's last position ----
             if self.over_predict:
@@ -976,8 +1000,8 @@ class AutoregressiveStage(nn.Module):
                 all_concs_over.append(conc_over[:, :, :actual_len])
 
             # Update anchors for next step
-            anchor_pos = positions[:, :, -1, :].detach()
-            anchor_head = headings[:, :, -1].detach()
+            anchor_pos = mem_tok_pos.squeeze(2)
+            anchor_head = mem_tok_head.squeeze(2)
             prev_positions = positions.detach()
             prev_headings = headings.detach()
 

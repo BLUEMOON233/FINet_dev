@@ -422,35 +422,31 @@ class Trainer(pl.LightningModule):
     def validation_step(self, data, batch_idx):
         if isinstance(data, list):
             data = data[-1]
-        try:
-            out = self(data)
-            _, loss_dict = self.cal_loss(out, data)
+        out = self(data)
+        _, loss_dict = self.cal_loss(out, data)
 
-            # Standard metrics on proposer output
-            metrics = self.val_metrics(out, data['target'][:, 0])
+        # Standard metrics on proposer output
+        metrics = self.val_metrics(out, data['target'][:, 0])
 
-            # Standard metrics on refiner output
-            if out['new_y_hat'] is not None:
-                out_new = {**out, 'y_hat': out['new_y_hat'], 'pi': out['new_pi']}
-                metrics_new = self.val_metrics_new(out_new, data['target'][:, 0])
+        # Standard metrics on refiner output
+        if out['new_y_hat'] is not None:
+            out_new = {**out, 'y_hat': out['new_y_hat'], 'pi': out['new_pi']}
+            metrics_new = self.val_metrics_new(out_new, data['target'][:, 0])
 
+        self.log_dict(
+            metrics,
+            prog_bar=True, on_step=False, on_epoch=True,
+            batch_size=1, sync_dist=True,
+        )
+        if out['new_y_hat'] is not None:
             self.log_dict(
-                metrics,
+                metrics_new,
                 prog_bar=True, on_step=False, on_epoch=True,
                 batch_size=1, sync_dist=True,
             )
-            if out['new_y_hat'] is not None:
-                self.log_dict(
-                    metrics_new,
-                    prog_bar=True, on_step=False, on_epoch=True,
-                    batch_size=1, sync_dist=True,
-                )
 
-            # Decoder diagnostics on validation
-            self._log_decoder_diagnostics(out, data, tag="val")
-
-        except Exception:
-            pass
+        # Decoder diagnostics on validation
+        self._log_decoder_diagnostics(out, data, tag="val")
 
     # ------------------------------------------------------------------ #
     #                              Testing                                #
@@ -498,18 +494,20 @@ class Trainer(pl.LightningModule):
             nn.SyncBatchNorm, nn.LayerNorm, nn.Embedding,
         )
         for module_name, module in self.named_modules():
-            for param_name, param in module.named_parameters():
+            for param_name, param in module.named_parameters(recurse=False):
                 full_param_name = (
                     "%s.%s" % (module_name, param_name) if module_name else param_name
                 )
-                if "bias" in param_name:
+                if not param.requires_grad:
+                    continue
+                if param_name.endswith("bias"):
                     no_decay.add(full_param_name)
-                elif "weight" in param_name:
+                elif param_name.endswith("weight"):
                     if isinstance(module, whitelist_weight_modules):
                         decay.add(full_param_name)
-                    elif isinstance(module, blacklist_weight_modules):
+                    else:
                         no_decay.add(full_param_name)
-                elif not ("weight" in param_name or "bias" in param_name):
+                else:
                     no_decay.add(full_param_name)
         param_dict = {
             param_name: param for param_name, param in self.named_parameters()
@@ -517,6 +515,8 @@ class Trainer(pl.LightningModule):
         inter_params = decay & no_decay
         union_params = decay | no_decay
         assert len(inter_params) == 0
+        missing_params = set(param_dict.keys()) - union_params
+        no_decay.update(missing_params)
 
         optim_groups = [
             {
