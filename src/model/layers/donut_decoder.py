@@ -259,12 +259,6 @@ class ModeAttention(nn.Module):
         self.to_s = nn.Linear(embed_dim, embed_dim)
         self.to_g = nn.Linear(embed_dim * 2, embed_dim)
         self.to_out = nn.Linear(embed_dim, embed_dim)
-        self.attn = nn.MultiheadAttention(
-            embed_dim,
-            num_heads,
-            dropout=0.1,
-            batch_first=True,
-        )
         self.drop_path = DropPath(drop_path) if drop_path > 0 else nn.Identity()
         self.mlp = nn.Sequential(
             nn.LayerNorm(embed_dim),
@@ -274,7 +268,7 @@ class ModeAttention(nn.Module):
         )
         self.drop_path2 = DropPath(drop_path) if drop_path > 0 else nn.Identity()
 
-    def forward(self, x, pred_step, mode_pos=None, mode_head=None):
+    def forward(self, x, pred_step, mode_pos, mode_head):
         mode_ids = torch.arange(x.shape[1], device=x.device)
         time_ids = torch.full((1,), pred_step, device=x.device, dtype=torch.long)
 
@@ -282,52 +276,50 @@ class ModeAttention(nn.Module):
         x = x + self.time_emb(time_ids).view(1, 1, -1)
 
         x_norm = self.norm(x)
-        if mode_pos is None or mode_head is None:
-            attn_out = self.attn(x_norm, x_norm, x_norm)[0]
-        else:
-            rel_pos = mode_pos[:, None, :, :] - mode_pos[:, :, None, :]  # key - query
-            dist = torch.linalg.norm(rel_pos, dim=-1)
-            valid_rel = dist > 1e-6
 
-            query_head_cos = mode_head.cos()
-            query_head_sin = mode_head.sin()
-            cross = (
-                query_head_cos[:, :, None] * rel_pos[..., 1]
-                - query_head_sin[:, :, None] * rel_pos[..., 0]
-            )
-            dot = (
-                query_head_cos[:, :, None] * rel_pos[..., 0]
-                + query_head_sin[:, :, None] * rel_pos[..., 1]
-            )
-            direction = _safe_signed_angle(cross, dot, valid_rel)
-            rel_head = wrap_angle(mode_head[:, None, :] - mode_head[:, :, None])
+        rel_pos = mode_pos[:, None, :, :] - mode_pos[:, :, None, :]  # key - query
+        dist = torch.linalg.norm(rel_pos, dim=-1)
+        valid_rel = dist > 1e-6
 
-            rel_feat = torch.stack([dist, direction, rel_head], dim=-1)
-            rel_emb = self.rel_emb(rel_feat)
+        query_head_cos = mode_head.cos()
+        query_head_sin = mode_head.sin()
+        cross = (
+            query_head_cos[:, :, None] * rel_pos[..., 1]
+            - query_head_sin[:, :, None] * rel_pos[..., 0]
+        )
+        dot = (
+            query_head_cos[:, :, None] * rel_pos[..., 0]
+            + query_head_sin[:, :, None] * rel_pos[..., 1]
+        )
+        direction = _safe_signed_angle(cross, dot, valid_rel)
+        rel_head = wrap_angle(mode_head[:, None, :] - mode_head[:, :, None])
 
-            B, M, D = x_norm.shape
-            q = self.to_q(x_norm).reshape(B, M, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-            k = self.to_k(x_norm).reshape(B, M, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-            v = self.to_v(x_norm).reshape(B, M, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        rel_feat = torch.stack([dist, direction, rel_head], dim=-1)
+        rel_emb = self.rel_emb(rel_feat)
 
-            k_rel = self.to_k_rel(rel_emb).reshape(B, M, M, self.num_heads, self.head_dim)
-            v_rel = self.to_v_rel(rel_emb).reshape(B, M, M, self.num_heads, self.head_dim)
-            bias = self.to_bias(rel_emb).permute(0, 3, 1, 2)
+        B, M, D = x_norm.shape
+        q = self.to_q(x_norm).reshape(B, M, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.to_k(x_norm).reshape(B, M, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.to_v(x_norm).reshape(B, M, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-            k_rel = k_rel.permute(0, 3, 1, 2, 4)
-            v_rel = v_rel.permute(0, 3, 1, 2, 4)
+        k_rel = self.to_k_rel(rel_emb).reshape(B, M, M, self.num_heads, self.head_dim)
+        v_rel = self.to_v_rel(rel_emb).reshape(B, M, M, self.num_heads, self.head_dim)
+        bias = self.to_bias(rel_emb).permute(0, 3, 1, 2)
 
-            logits = (
-                q.unsqueeze(3) * (k.unsqueeze(2) + k_rel)
-            ).sum(dim=-1) * self.scale + bias
-            attn = F.softmax(logits, dim=-1)
-            attn = F.dropout(attn, p=0.1, training=self.training)
+        k_rel = k_rel.permute(0, 3, 1, 2, 4)
+        v_rel = v_rel.permute(0, 3, 1, 2, 4)
 
-            attn_out = (attn.unsqueeze(-1) * (v.unsqueeze(2) + v_rel)).sum(dim=3)
-            attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, M, D)
-            attn_out = self.to_out(attn_out)
-            gate = torch.sigmoid(self.to_g(torch.cat([attn_out, x_norm], dim=-1)))
-            attn_out = attn_out + gate * (self.to_s(x_norm) - attn_out)
+        logits = (
+            q.unsqueeze(3) * (k.unsqueeze(2) + k_rel)
+        ).sum(dim=-1) * self.scale + bias
+        attn = F.softmax(logits, dim=-1)
+        attn = F.dropout(attn, p=0.1, training=self.training)
+
+        attn_out = (attn.unsqueeze(-1) * (v.unsqueeze(2) + v_rel)).sum(dim=3)
+        attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, M, D)
+        attn_out = self.to_out(attn_out)
+        gate = torch.sigmoid(self.to_g(torch.cat([attn_out, x_norm], dim=-1)))
+        attn_out = attn_out + gate * (self.to_s(x_norm) - attn_out)
 
         x = x + self.drop_path(attn_out)
         x = x + self.drop_path2(self.mlp(x))
@@ -391,13 +383,6 @@ class AutoregressiveStage(nn.Module):
                 num_heads=num_heads,
                 drop_path=drop_path,
             )
-            for _ in range(num_repetitions)
-        ])
-
-        # Kept for checkpoint compatibility, but disabled in the current
-        # T-BiMamba-M design where scene interaction is handled by BiMamba.
-        self.cross_attns = nn.ModuleList([
-            Cross_Block(dim=embed_dim, num_heads=num_heads, drop_path=drop_path)
             for _ in range(num_repetitions)
         ])
 
@@ -603,6 +588,46 @@ class AutoregressiveStage(nn.Module):
         )
         return positions, headings
 
+    @staticmethod
+    def _assemble_over_preds(
+        all_positions_over,
+        all_scales_over,
+        all_headings_over,
+        all_concs_over,
+        scal,
+        conc_hat,
+        T,
+    ):
+        """Assemble over-prediction outputs with per-token cumsum offset.
+
+        Over-prediction uncertainty continues growing from the boundary reached
+        at the end of each token's normal window — scale and concentration both
+        start where the normal window ended, rather than resetting to a constant.
+        """
+        B, M = scal.shape[:2]
+        S = scal.shape[2] // T
+
+        y_hat_over = torch.cat(all_positions_over, dim=2)
+        heading_over = torch.cat(all_headings_over, dim=2)
+
+        # Scale: seed each token's over-prediction cumsum from its normal boundary.
+        # scal[:, :, T-1::T, :] is the accumulated scale at each token's last step.
+        scal_over_raw = torch.cat(all_scales_over, dim=2).reshape(B, M, S, T, 2)
+        offsets_scal = scal[:, :, T - 1::T, :].unsqueeze(3)             # [B, M, S, 1, 2]
+        scal_over = (
+            offsets_scal + torch.cumsum(scal_over_raw, dim=3)
+        ).reshape(B, M, S * T, 2)
+
+        # Concentration: 1/conc_hat recovers the running denominator at each boundary;
+        # continue the inverse-conc cumsum from there, then invert back.
+        conc_over_raw = torch.cat(all_concs_over, dim=2).reshape(B, M, S, T)
+        offsets_conc = (1.0 / conc_hat[:, :, T - 1::T]).unsqueeze(3)   # [B, M, S, 1]
+        conc_over = (
+            1.0 / (offsets_conc + torch.cumsum(conc_over_raw, dim=3))
+        ).reshape(B, M, S * T)
+
+        return y_hat_over, scal_over, heading_over, conc_over
+
     def _decode_token_sequence(
         self,
         token_stack,
@@ -724,13 +749,10 @@ class AutoregressiveStage(nn.Module):
         conc_hat = 1.0 / (0.02 + torch.cumsum(conc_hat, dim=2))
 
         if self.over_predict and all_positions_over:
-            y_hat_over = torch.cat(all_positions_over, dim=2)
-            scal_over = torch.cat(all_scales_over, dim=2)
-            scal_over = 0.1 + scal_over
-
-            heading_over = torch.cat(all_headings_over, dim=2)
-            conc_over = torch.cat(all_concs_over, dim=2)
-            conc_over = 1.0 / (0.02 + conc_over)
+            y_hat_over, scal_over, heading_over, conc_over = self._assemble_over_preds(
+                all_positions_over, all_scales_over, all_headings_over, all_concs_over,
+                scal, conc_hat, T,
+            )
         else:
             y_hat_over = heading_over = scal_over = conc_over = None
 
@@ -1043,20 +1065,25 @@ class AutoregressiveStage(nn.Module):
                 proposed_positions=proposed_positions,
                 proposed_headings=proposed_headings,
             )
-        feat_pool = feat_stack.max(dim=2)[0]
+        # Use the last AR token as the trajectory-level feature for pi.
+        # Through temporal attention, each token attends to all previous tokens,
+        # so the final token implicitly aggregates the full sequence — consistent
+        # with DONUT's design of reading pi from the last step's dedicated output.
+        feat_pool = feat_stack[:, :, -1, :]
         pi = self.pi_head(feat_pool).squeeze(-1)
 
         # ---- Assemble over-prediction output ----
-        if self.over_predict and all_positions_over:
-            y_hat_over = torch.cat(all_positions_over, dim=2)
-            scal_over = torch.cat(all_scales_over, dim=2)
-            scal_over = 0.1 + scal_over
-
-            heading_over = torch.cat(all_headings_over, dim=2)
-            conc_over = torch.cat(all_concs_over, dim=2)
-            conc_over = 1.0 / (0.02 + conc_over)
-        else:
-            y_hat_over = heading_over = scal_over = conc_over = None
+        # Refiner: already computed by _decode_token_sequence from globally-refined
+        #          tokens — do NOT overwrite with AR-phase results.
+        # Proposer: assemble from AR-phase collected lists (no global refinement).
+        if not self.is_refiner:
+            if self.over_predict and all_positions_over:
+                y_hat_over, scal_over, heading_over, conc_over = self._assemble_over_preds(
+                    all_positions_over, all_scales_over, all_headings_over, all_concs_over,
+                    scal, conc_hat, T,
+                )
+            else:
+                y_hat_over = heading_over = scal_over = conc_over = None
 
         return (y_hat, pi, scal, step_feats, heading_hat, conc_hat,
                 y_hat_over, scal_over, heading_over, conc_over)
@@ -1114,61 +1141,8 @@ class DonutMambaDecoder(nn.Module):
             over_predict=over_predict,
         )
 
-    def forward(
-        self,
-        mode_tokens,
-        ego_feat,
-        scene_encoding,
-        mask=None,
-        init_heading=None,
-        proposer_history_positions=None,
-        proposer_history_headings=None,
-        proposer_history_mask=None,
-        refiner_history_positions=None,
-        refiner_history_headings=None,
-        refiner_history_mask=None,
-    ):
-        # Stage 1: Proposer
-        (y_hat, pi, scal, proposer_feats, heading_hat, conc_hat,
-         y_hat_over, scal_over, heading_over, conc_over) = self.proposer(
-            mode_tokens=mode_tokens,
-            ego_feat=ego_feat,
-            scene_encoding=scene_encoding,
-            scene_mask=mask,
-            init_heading=init_heading,
-            history_positions=proposer_history_positions,
-            history_headings=proposer_history_headings,
-            history_mask=proposer_history_mask,
-        )
-
-        # Stage 2: Refiner
-        (new_y_hat, new_pi, scal_new, _, new_heading_hat, new_conc_hat,
-         new_y_hat_over, new_scal_over, new_heading_over, new_conc_over) = self.refiner(
-            mode_tokens=mode_tokens,
-            ego_feat=ego_feat,
-            scene_encoding=scene_encoding,
-            scene_mask=mask,
-            proposed_positions=y_hat.detach(),
-            proposed_headings=heading_hat.detach(),
-            proposer_feats=proposer_feats,
-            init_heading=init_heading,
-            history_positions=refiner_history_positions,
-            history_headings=refiner_history_headings,
-            history_mask=refiner_history_mask,
-        )
-
-        dense_pred = None
-        mode_features = None
-        return {
-            "dense_pred": dense_pred,
-            "y_hat": y_hat, "pi": pi, "scal": scal,
-            "mode_features": mode_features,
-            "new_y_hat": new_y_hat, "new_pi": new_pi, "scal_new": scal_new,
-            "heading_hat": heading_hat, "conc_hat": conc_hat,
-            "new_heading_hat": new_heading_hat, "new_conc_hat": new_conc_hat,
-            # Over-prediction
-            "y_hat_over": y_hat_over, "scal_over": scal_over,
-            "heading_over": heading_over, "conc_over": conc_over,
-            "new_y_hat_over": new_y_hat_over, "new_scal_over": new_scal_over,
-            "new_heading_over": new_heading_over, "new_conc_over": new_conc_over,
-        }
+    # NOTE: forward() is intentionally omitted.
+    # model_forecast.py calls self.time_decoder.proposer(...) and
+    # self.time_decoder.refiner(...) directly with stage-specific
+    # arguments (x_centers, valid_mask, init_sort_center, etc.)
+    # that differ between the two stages.

@@ -42,9 +42,7 @@ class VonMisesNLLLoss(nn.Module):
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         loc, conc = pred.chunk(2, dim=-1)
-        conc = conc.clone()
-        with torch.no_grad():
-            conc.clamp_(min=self.eps)
+        conc = conc.clamp(min=self.eps)
         nll = -conc * torch.cos(target - loc) + math.log(2 * math.pi) + _log_modified_bessel_fn(conc, order=0)
         if self.reduction == 'mean':
             return nll.mean()

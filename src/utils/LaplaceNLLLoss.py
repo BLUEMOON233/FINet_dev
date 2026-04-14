@@ -17,9 +17,7 @@ class LaplaceNLLLoss(nn.Module):
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         loc, scale = pred.chunk(2, dim=-1)
-        scale = scale.clone()
-        with torch.no_grad():
-            scale.clamp_(min=self.eps)
+        scale = scale.clamp(min=self.eps)
         nll = torch.log(2 * scale) + torch.abs(target - loc) / scale
         if self.reduction == 'mean':
             return nll.mean()
