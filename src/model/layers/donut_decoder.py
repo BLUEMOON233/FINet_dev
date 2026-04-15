@@ -910,15 +910,26 @@ class AutoregressiveStage(nn.Module):
                 scene_encoding = self._unsort_scene(sorted_scene_out, sort_idx)
 
                 # -- M: Mode self-attention with relative geometry from the
-                # current chunk endpoint prediction --
-                mode_positions, mode_headings = self._decode_token_geometry(
-                    tok,
-                    anchor_pos,
-                    anchor_head,
-                    step,
-                    proposed_positions=proposed_positions,
-                    proposed_headings=proposed_headings,
-                )
+                # current chunk endpoint prediction.
+                # torch.no_grad() is intentional: _decode_token_geometry
+                # calls self.detokenizer only to obtain geometric positions
+                # for routing — its outputs never enter the loss directly.
+                # Without the guard, detokenizer.shared / pos_head /
+                # heading_head would receive (R+1) gradient paths per AR
+                # step while scale_head / conc_head only get 1, causing a
+                # systematic 3:1 imbalance that under-trains uncertainty.
+                # ModeAttention spatial params (to_k_rel, to_v_rel, to_bias)
+                # still train correctly: PyTorch computes d(loss)/d(weight)
+                # even when the input tensor has requires_grad=False.
+                with torch.no_grad():
+                    mode_positions, mode_headings = self._decode_token_geometry(
+                        tok,
+                        anchor_pos,
+                        anchor_head,
+                        step,
+                        proposed_positions=proposed_positions,
+                        proposed_headings=proposed_headings,
+                    )
                 tok = self.mode_attns[rep](
                     tok,
                     step + 1,
