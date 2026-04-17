@@ -77,21 +77,6 @@ class Trainer(pl.LightningModule):
     def forward(self, data):
         return self.net(data)
 
-    def predict(self, data):
-        memory_dict = None
-        predictions = []
-        probs = []
-        for i in range(len(data)):
-            cur_data = data[i]
-            cur_data['memory_dict'] = memory_dict
-            out = self(cur_data)
-            memory_dict = out['memory_dict']
-            prediction, prob = self.submission_handler.format_data(
-                cur_data, out["y_hat"], out["pi"], inference=True)
-            predictions.append(prediction)
-            probs.append(prob)
-        return predictions, probs
-
     # ------------------------------------------------------------------ #
     #                      Decoder Monitoring Helpers                      #
     # ------------------------------------------------------------------ #
@@ -301,57 +286,57 @@ class Trainer(pl.LightningModule):
         B = y.shape[0]
         index0 = torch.arange(B, device=y.device)
 
-        # --- Best mode selection (from proposer L2, matches DONUT) ---
-        l2_norm = torch.linalg.norm(y_hat - y[:, None], dim=-1).mean(-1)  # [B, 6]
-        best_mode = l2_norm.argmin(dim=-1)  # [B]
+        # --- Best mode selection: proposer and refiner use their own oracle ---
+        best_mode_prop = torch.linalg.norm(y_hat - y[:, None], dim=-1).mean(-1).argmin(dim=-1)      # [B]
+        best_mode_ref  = torch.linalg.norm(new_y_hat - y[:, None], dim=-1).mean(-1).argmin(dim=-1)  # [B]
 
         # --- Regression loss: proposer (Laplace NLL) ---
         reg_loss_prop = self.compute_reg_loss(
-            y_hat[index0, best_mode], scal[index0, best_mode], y)
+            y_hat[index0, best_mode_prop], scal[index0, best_mode_prop], y)
 
-        # --- Regression loss: refiner (Laplace NLL, same best_mode) ---
+        # --- Regression loss: refiner (Laplace NLL) ---
         reg_loss_ref = self.compute_reg_loss(
-            new_y_hat[index0, best_mode], scal_new[index0, best_mode], y)
+            new_y_hat[index0, best_mode_ref], scal_new[index0, best_mode_ref], y)
 
         # --- Heading regression loss: proposer (Von Mises NLL) ---
         heading_reg_prop = self.compute_heading_reg_loss(
-            heading_hat[index0, best_mode], conc_hat[index0, best_mode], gt_heading)
+            heading_hat[index0, best_mode_prop], conc_hat[index0, best_mode_prop], gt_heading)
 
         # --- Heading regression loss: refiner ---
         heading_reg_ref = self.compute_heading_reg_loss(
-            new_heading_hat[index0, best_mode], new_conc_hat[index0, best_mode], gt_heading)
+            new_heading_hat[index0, best_mode_ref], new_conc_hat[index0, best_mode_ref], gt_heading)
 
-        # --- Over-prediction loss (shifted GT, proposer + refiner) ---
+        # --- Over-prediction loss (shifted GT, proposer + refiner each with own best_mode) ---
         over_loss = torch.tensor(0.0, device=y.device)
         t_per_tok = self.net.t_per_tok if hasattr(self.net, 't_per_tok') else 10
         shift = t_per_tok  # =10
         t_pred = y.shape[1]  # =60
         over_len = t_pred - shift  # =50
 
-        for over_key_prefix, stage_name in [("", "prop"), ("new_", "ref")]:
+        for over_key_prefix, bm in [("", best_mode_prop), ("new_", best_mode_ref)]:
             y_over = out.get(f"{over_key_prefix}y_hat_over")
             s_over = out.get(f"{over_key_prefix}scal_over")
             h_over = out.get(f"{over_key_prefix}heading_over")
             c_over = out.get(f"{over_key_prefix}conc_over")
             if y_over is not None and y_over.shape[2] >= over_len:
-                # Position over-prediction loss
                 over_loss = over_loss + self.compute_reg_loss(
-                    y_over[index0, best_mode, :over_len],
-                    s_over[index0, best_mode, :over_len],
+                    y_over[index0, bm, :over_len],
+                    s_over[index0, bm, :over_len],
                     y[:, shift:])
-                # Heading over-prediction loss
                 if h_over is not None and h_over.shape[2] >= over_len:
                     over_loss = over_loss + self.compute_heading_reg_loss(
-                        h_over[index0, best_mode, :over_len],
-                        c_over[index0, best_mode, :over_len],
+                        h_over[index0, bm, :over_len],
+                        c_over[index0, bm, :over_len],
                         gt_heading[:, shift:])
 
-        # --- Classification loss: mixture NLL (refiner only, DONUT style) ---
-        nll_all = self.compute_cls_nll(
-            new_y_hat, scal_new, y,
-            new_heading_hat, new_conc_hat, gt_heading)
-        log_pi = F.log_softmax(new_pi, dim=-1)
-        cls_loss = -torch.logsumexp(log_pi - nll_all, dim=-1).mean()
+        # --- Classification loss: proposer and refiner each with own pi/nll ---
+        nll_prop = self.compute_cls_nll(y_hat, scal, y, heading_hat, conc_hat, gt_heading)
+        cls_loss_prop = -torch.logsumexp(F.log_softmax(pi, dim=-1) - nll_prop, dim=-1).mean()
+
+        nll_ref = self.compute_cls_nll(new_y_hat, scal_new, y, new_heading_hat, new_conc_hat, gt_heading)
+        cls_loss_ref = -torch.logsumexp(F.log_softmax(new_pi, dim=-1) - nll_ref, dim=-1).mean()
+
+        cls_loss = cls_loss_prop + cls_loss_ref
 
         # --- Endpoint offset loss (encoder auxiliary, unchanged) ---
         if ep_offsets is not None:
@@ -382,7 +367,8 @@ class Trainer(pl.LightningModule):
             f"{tag}loss": loss.item(),
             f"{tag}reg_loss_prop": reg_loss_prop.item(),
             f"{tag}reg_loss_ref": reg_loss_ref.item(),
-            f"{tag}cls_loss": cls_loss.item(),
+            f"{tag}cls_loss_prop": cls_loss_prop.item(),
+            f"{tag}cls_loss_ref": cls_loss_ref.item(),
             f"{tag}heading_reg_prop": heading_reg_prop.item(),
             f"{tag}heading_reg_ref": heading_reg_ref.item(),
             f"{tag}over_loss": over_loss.item(),

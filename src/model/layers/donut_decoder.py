@@ -909,18 +909,12 @@ class AutoregressiveStage(nn.Module):
                 tok = x_combined[:, N_scene:]  # [B, M, D]
                 scene_encoding = self._unsort_scene(sorted_scene_out, sort_idx)
 
-                # -- M: Mode self-attention with relative geometry from the
-                # current chunk endpoint prediction.
-                # torch.no_grad() is intentional: _decode_token_geometry
-                # calls self.detokenizer only to obtain geometric positions
-                # for routing — its outputs never enter the loss directly.
-                # Without the guard, detokenizer.shared / pos_head /
-                # heading_head would receive (R+1) gradient paths per AR
-                # step while scale_head / conc_head only get 1, causing a
-                # systematic 3:1 imbalance that under-trains uncertainty.
-                # ModeAttention spatial params (to_k_rel, to_v_rel, to_bias)
-                # still train correctly: PyTorch computes d(loss)/d(weight)
-                # even when the input tensor has requires_grad=False.
+                # -- Update sort_center after each BiMamba rep (WTA) --
+                # Using the WTA mode's endpoint rather than a pi-weighted average
+                # ensures sort_center always lies on a real predicted trajectory,
+                # which matters most when modes are spatially spread out.
+                # torch.no_grad() keeps this routing signal gradient-free,
+                # consistent with the step-end update below.
                 with torch.no_grad():
                     mode_positions, mode_headings = self._decode_token_geometry(
                         tok,
@@ -930,6 +924,12 @@ class AutoregressiveStage(nn.Module):
                         proposed_positions=proposed_positions,
                         proposed_headings=proposed_headings,
                     )
+                    pi_rep = self.pi_head(tok).squeeze(-1)          # [B, M]
+                    best_mode_rep = pi_rep.argmax(dim=1)             # [B]
+                    sort_center = mode_positions[
+                        torch.arange(B, device=device), best_mode_rep, -1, :
+                    ]                                                # [B, 2]
+
                 tok = self.mode_attns[rep](
                     tok,
                     step + 1,
@@ -1038,11 +1038,13 @@ class AutoregressiveStage(nn.Module):
             prev_positions = positions.detach()
             prev_headings = headings.detach()
 
-            # Update sort center with pi-weighted predicted endpoint
+            # Update sort center with WTA predicted endpoint
             with torch.no_grad():
-                pi_now = self.pi_head(tok).squeeze(-1)  # [B, M]
-                pi_weights = F.softmax(pi_now, dim=1).unsqueeze(-1)  # [B, M, 1]
-                sort_center = (pi_weights * positions[:, :, -1, :]).sum(dim=1)  # [B, 2]
+                pi_now = self.pi_head(tok).squeeze(-1)       # [B, M]
+                best_mode_step = pi_now.argmax(dim=1)         # [B]
+                sort_center = positions[
+                    torch.arange(B, device=device), best_mode_step, -1, :
+                ]                                             # [B, 2]
 
         # ---- Assemble normal output ----
         y_hat = torch.cat(all_positions, dim=2)
