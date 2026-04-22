@@ -264,11 +264,11 @@ class ModelForecast(nn.Module):
                 history_mask=proposer_history_mask,
             )
 
-        ###### Pi-weighted endpoint for Refiner sorting (detached) ######
-        pi_weights = F.softmax(pi, dim=1).unsqueeze(-1)       # [B, 6, 1]
-        proposer_endpoint = (
-            pi_weights * y_hat[:, :, -1, :]
-        ).sum(dim=1).detach()                                  # [B, 2]
+        ###### Top-1 endpoint for Refiner sorting (detached) ######
+        top1_mode = pi.argmax(dim=1)
+        proposer_endpoint = y_hat[
+            torch.arange(B, device=y_hat.device), top1_mode, -1
+        ].detach()                                              # [B, 2]
 
         ###### Other agents (from encoder features) ######
         x_others = x_encoder[:, 1:N]

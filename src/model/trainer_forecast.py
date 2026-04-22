@@ -286,34 +286,33 @@ class Trainer(pl.LightningModule):
         B = y.shape[0]
         index0 = torch.arange(B, device=y.device)
 
-        # --- Best mode selection: proposer and refiner use their own oracle ---
-        best_mode_prop = torch.linalg.norm(y_hat - y[:, None], dim=-1).mean(-1).argmin(dim=-1)      # [B]
-        best_mode_ref  = torch.linalg.norm(new_y_hat - y[:, None], dim=-1).mean(-1).argmin(dim=-1)  # [B]
+        # --- Best mode selection: proposer oracle shared by both stages ---
+        best_mode = torch.linalg.norm(y_hat - y[:, None], dim=-1).mean(-1).argmin(dim=-1)  # [B]
 
         # --- Regression loss: proposer (Laplace NLL) ---
         reg_loss_prop = self.compute_reg_loss(
-            y_hat[index0, best_mode_prop], scal[index0, best_mode_prop], y)
+            y_hat[index0, best_mode], scal[index0, best_mode], y)
 
         # --- Regression loss: refiner (Laplace NLL) ---
         reg_loss_ref = self.compute_reg_loss(
-            new_y_hat[index0, best_mode_ref], scal_new[index0, best_mode_ref], y)
+            new_y_hat[index0, best_mode], scal_new[index0, best_mode], y)
 
         # --- Heading regression loss: proposer (Von Mises NLL) ---
         heading_reg_prop = self.compute_heading_reg_loss(
-            heading_hat[index0, best_mode_prop], conc_hat[index0, best_mode_prop], gt_heading)
+            heading_hat[index0, best_mode], conc_hat[index0, best_mode], gt_heading)
 
         # --- Heading regression loss: refiner ---
         heading_reg_ref = self.compute_heading_reg_loss(
-            new_heading_hat[index0, best_mode_ref], new_conc_hat[index0, best_mode_ref], gt_heading)
+            new_heading_hat[index0, best_mode], new_conc_hat[index0, best_mode], gt_heading)
 
-        # --- Over-prediction loss (shifted GT, proposer + refiner each with own best_mode) ---
+        # --- Over-prediction loss (shifted GT, shared best mode) ---
         over_loss = torch.tensor(0.0, device=y.device)
         t_per_tok = self.net.t_per_tok if hasattr(self.net, 't_per_tok') else 10
         shift = t_per_tok  # =10
         t_pred = y.shape[1]  # =60
         over_len = t_pred - shift  # =50
 
-        for over_key_prefix, bm in [("", best_mode_prop), ("new_", best_mode_ref)]:
+        for over_key_prefix, bm in [("", best_mode), ("new_", best_mode)]:
             y_over = out.get(f"{over_key_prefix}y_hat_over")
             s_over = out.get(f"{over_key_prefix}scal_over")
             h_over = out.get(f"{over_key_prefix}heading_over")
